@@ -1,6 +1,6 @@
 const { default: makeWASocket } = require('whaileys/lib/Socket');
 const { downloadContentFromMessage, generateWAMessageFromContent, generateWAMessage, isJidNewsletter, getContentType } = require('whaileys');
-const { exec, execSync } = require('child_process');
+const { exec, execSync, spawn } = require('child_process');
 const { parseHTML } = require('linkedom');
 const axios = require('axios');
 const pathz = require('path');
@@ -11,10 +11,13 @@ const crypto = require('crypto');
 const PerformanceOptimizer = require('./utils/performanceOptimizer');
 const cron = require('node-cron');
 const ia = require('./funcs/private/ia');
-const { formatUptime, normalizar, isGroupId, isUserId, isValidLid, isValidJid, getUserName, getLidFromJid, buildUserId, getBotId, ensureDirectoryExists, ensureJsonFileExists, loadJsonFile } = require('./utils/helpers');
+const vipCommandsManager = require('./utils/vipCommandsManager');
+const { formatUptime, normalizar, isGroupId, isUserId, isValidLid, isValidJid, getUserName, getLidFromJid, buildUserId, getBotId, ensureDirectoryExists, ensureJsonFileExists, loadJsonFile, initJidLidCache, saveJidLidCache, getLidFromJidCached, normalizeUserId, convertIdsToLid, idsMatch, idInArray } = require('./utils/helpers');
 const {
   loadMsgPrefix,
   saveMsgPrefix,
+  loadMsgBotOn,
+  saveMsgBotOn,
   loadCmdNotFoundConfig,
   saveCmdNotFoundConfig,
   validateMessageTemplate,
@@ -66,6 +69,7 @@ const {
   ensureUserChallenge,
   updateChallenge,
   isChallengeCompleted,
+  updateQuestProgress,
   SKILL_LIST,
   ensureUserSkills,
   skillXpForNext,
@@ -143,7 +147,8 @@ const {
   BOT_STATE_FILE,
   AUTO_HORARIOS_FILE,
   AUTO_MENSAGENS_FILE,
-  MODO_LITE_FILE
+  MODO_LITE_FILE,
+  JID_LID_CACHE_FILE
 } = require('./utils/paths');
 const API_KEY_REQUIRED_MESSAGE = 'Este comando precisa de API key para funcionar. Meu dono já foi notificado! 😺';
 const OWNER_ONLY_MESSAGE = '🚫 Este comando é apenas para o dono do bot!';
@@ -224,10 +229,29 @@ try {
   console.error('Erro ao ler package.json:', e.message);
 }
 const botVersion = packageJson.version;
+
+// Inicializa o cache JID→LID
+initJidLidCache(JID_LID_CACHE_FILE);
+
+// Salva cache periodicamente (a cada 5 minutos)
+setInterval(() => {
+  saveJidLidCache();
+}, 5 * 60 * 1000);
   
 async function NazuninhaBotExec(nazu, info, store, messagesCache, rentalExpirationManager = null) {
+  // Log de início de processamento para debug paralelo
+  const msgId = info?.key?.id?.slice(-6) || 'unknown';
+  const from = info?.key?.remoteJid || 'unknown';
+
   let config = loadJsonFile(CONFIG_FILE, {});
   ensureDatabaseIntegrity({ log: Boolean(config?.debug) });
+  
+  // Log de debug aprimorado para rastreamento de IDs
+  const debugLog = (msg, data = null) => {
+    if (config?.debug) {
+      console.log(`[DEBUG] ${msg}`, data || '');
+    }
+  };
   
   async function getCachedGroupMetadata(groupId) {
     try {
@@ -270,6 +294,60 @@ async function NazuninhaBotExec(nazu, info, store, messagesCache, rentalExpirati
     KeyCog = false;
   } else if (!isValidApiKey(KeyCog)) {
     KeyCog = false;
+  }
+
+  // Sistema de degradação automática de pets
+  function applyPetDegradation(pets) {
+    if (!Array.isArray(pets) || pets.length === 0) return { changed: false };
+    
+    const now = Date.now();
+    const oneHour = 3600000; // 1 hora em ms
+    const oneDayInHours = 24; // Degradação total em 24 horas se não cuidar
+    
+    let changed = false;
+    
+    pets.forEach(pet => {
+      // Inicializa lastUpdate se não existir
+      if (!pet.lastUpdate) {
+        pet.lastUpdate = now;
+        changed = true;
+        return;
+      }
+      
+      const timePassed = now - pet.lastUpdate;
+      const hoursPassed = timePassed / oneHour;
+      
+      // Só degrada se passou mais de 1 hora
+      if (hoursPassed >= 1) {
+        // Calcula degradação proporcional ao tempo
+        const hungerDegrade = Math.floor(hoursPassed * (100 / oneDayInHours)); // ~4.17 por hora
+        const moodDegrade = Math.floor(hoursPassed * (100 / (oneDayInHours * 2))); // ~2.08 por hora (degrada mais devagar)
+        
+        // Aplica degradação
+        const oldHunger = pet.hunger || 100;
+        const oldMood = pet.mood || 100;
+        
+        pet.hunger = Math.max(0, oldHunger - hungerDegrade);
+        pet.mood = Math.max(0, oldMood - moodDegrade);
+        
+        // Se fome está muito baixa, humor degrada mais rápido
+        if (pet.hunger < 30) {
+          pet.mood = Math.max(0, pet.mood - Math.floor(hoursPassed * 5));
+        }
+        
+        // Se fome chegou a 0, pet perde HP gradualmente
+        if (pet.hunger === 0 && hoursPassed >= 2) {
+          const hpLoss = Math.floor(hoursPassed * (pet.maxHp * 0.02)); // 2% do HP máximo por hora
+          pet.hp = Math.max(1, (pet.hp || pet.maxHp) - hpLoss); // Nunca deixa morrer (mínimo 1 HP)
+        }
+        
+        // Atualiza timestamp
+        pet.lastUpdate = now;
+        changed = true;
+      }
+    });
+    
+    return { changed };
   }
 
   async function handleAutoDownload(nazu, from, url, info) {
@@ -351,14 +429,14 @@ async function NazuninhaBotExec(nazu, info, store, messagesCache, rentalExpirati
   menuAlterador,
   menuLogos,
   menuTopCmd,
-  menuRPG
+  menuRPG,
+  menuVIP
   } = menus;
   const prefix = prefixo;
   const numerodonoStr = String(numerodono);
   const modules = require('./funcs/exports.js');
   const {
     youtube,
-    banner,
     tiktok,
     pinterest,
     igdl,
@@ -417,13 +495,37 @@ async function NazuninhaBotExec(nazu, info, store, messagesCache, rentalExpirati
     if (!info.key.participant && !info.key.remoteJid) return;
     let sender;
     if (isGroup) {
-      const participants = Object.keys(info.key).filter(k => k.startsWith("participant")).map(k => info.key[k]).filter(Boolean);
-      if (participants.length) {
-        sender = participants.find(p => p.includes("lid")) || participants[0];
-      };
+      // Prioriza participant, depois busca por LID, com fallback para JID
+      sender = info.key.participant || info.message?.participant;
+      
+      if (!sender) {
+        const participants = Object.keys(info.key).filter(k => k.startsWith("participant")).map(k => info.key[k]).filter(Boolean);
+        if (participants.length) {
+          sender = participants.find(p => p.includes("@lid")) || participants.find(p => p.includes("@s.whatsapp.net")) || participants[0];
+        }
+      }
+      
+      // Se ainda não encontrou, tenta extrair do contextInfo
+      if (!sender && info.message?.extendedTextMessage?.contextInfo?.participant) {
+        sender = info.message.extendedTextMessage.contextInfo.participant;
+      }
+      
+      // Se for JID, converte para LID usando cache
+      if (sender && isValidJid(sender)) {
+        sender = await getLidFromJidCached(nazu, sender);
+      }
     } else {
       sender = info.key.remoteJid;
-    };
+      
+      // Se for JID no PV, converte para LID usando cache
+      if (sender && isValidJid(sender)) {
+        sender = await getLidFromJidCached(nazu, sender);
+      }
+    }
+    
+    // Debug: log do sender identificado
+    debugLog('Sender identificado:', { sender, isGroup, from: from?.substring(0, 20) });
+    
     const pushname = info.pushName || '';
     const isStatus = from?.endsWith('@broadcast') || false;
     const nmrdn = buildUserId(numerodono, config);
@@ -432,8 +534,31 @@ async function NazuninhaBotExec(nazu, info, store, messagesCache, rentalExpirati
     const ownerJid = `${numerodono}@s.whatsapp.net`;
     const botId = getBotId(nazu);
     const isBotSender = sender === botId || sender === nazu.user?.id?.split(':')[0] + '@s.whatsapp.net' || sender === nazu.user?.id?.split(':')[0] + '@lid';
-    const isOwner = nmrdn === sender || ownerJid === sender || (lidowner && lidowner === sender) || info.key.fromMe || isBotSender;
+    
+    // Verificação melhorada de dono (compara base do número sem sufixo)
+    const senderBase = sender.split('@')[0];
+    const ownerBase = String(numerodono);
+    const lidOwnerBase = lidowner ? lidowner.split('@')[0] : null;
+    
+    const isOwner = senderBase === ownerBase || 
+                    sender === nmrdn || 
+                    sender === ownerJid || 
+                    (lidowner && sender === lidowner) || 
+                    (lidOwnerBase && senderBase === lidOwnerBase) ||
+                    info.key.fromMe || 
+                    isBotSender;
+    
     const isOwnerOrSub = isOwner || isSubOwner;
+    
+    // Debug: log das verificações de permissão
+    debugLog('Verificações de permissão:', { 
+      sender: sender?.substring(0, 30), 
+      senderBase, 
+      ownerBase, 
+      isOwner, 
+      isSubOwner 
+    });
+    
     const type = getContentType(info.message);
     const isMedia = ["imageMessage", "videoMessage", "audioMessage"].includes(type);
     const isImage = type === 'imageMessage';
@@ -618,6 +743,7 @@ async function NazuninhaBotExec(nazu, info, store, messagesCache, rentalExpirati
       groupData.allowedModCommands = groupData.allowedModCommands || [];
       groupData.mutedUsers = groupData.mutedUsers || {};
       groupData.levelingEnabled = groupData.levelingEnabled || false;
+      groupData.adminWhitelist = groupData.adminWhitelist || {};
       if (!groupData.roles || typeof groupData.roles !== 'object') {
         groupData.roles = {};
       }
@@ -658,10 +784,34 @@ async function NazuninhaBotExec(nazu, info, store, messagesCache, rentalExpirati
         writeJsonFile(groupFile, groupData);
       }
     };
+    
+    // Função para verificar se um usuário está na whitelist para determinado anti
+    const isUserWhitelisted = (userId, antiType) => {
+      if (!groupData.adminWhitelist || typeof groupData.adminWhitelist !== 'object') {
+        return false;
+      }
+      
+      const userWhitelist = groupData.adminWhitelist[userId];
+      if (!userWhitelist || !Array.isArray(userWhitelist.antis)) {
+        return false;
+      }
+      
+      return userWhitelist.antis.includes(antiType);
+    };
     const groupPrefix = groupData.customPrefix || prefixo;
     var isCmd = body.trim().startsWith(groupPrefix);
     const aliases = loadCommandAliases();
     const matchedAlias = aliases.find(item => normalizar(budy2.trim().slice(groupPrefix.length).split(/ +/).shift().trim()) === item.alias);
+    
+    // Se encontrou um alias, aplicar parâmetros fixos
+    if (matchedAlias && matchedAlias.fixedParams) {
+      const userArgs = body.trim().slice(groupPrefix.length).split(/ +/).slice(1).join(' ');
+      const combinedParams = matchedAlias.fixedParams + (userArgs ? ' ' + userArgs : '');
+      q = combinedParams;
+      args.length = 0;
+      args.push(...combinedParams.split(/ +/));
+    }
+    
     var command = isCmd ? matchedAlias ? matchedAlias.command : normalizar(body.trim().slice(groupPrefix.length).split(/ +/).shift().trim()).replace(/\s+/g, '') : null;
     const isPremium = premiumListaZinha[sender] || premiumListaZinha[from] || isOwner;
     if (!isGroup) {
@@ -688,35 +838,57 @@ async function NazuninhaBotExec(nazu, info, store, messagesCache, rentalExpirati
     // Enhanced participant ID extraction with both LID and JID support
     const extractParticipantId = (participant) => {
       if (!participant) return null;
-      // Prioritize LID format, fallback to JID format
-      return participant.lid || participant.id || null;
+      // Retorna LID se disponível, senão retorna o ID padrão
+      let id = participant.lid || participant.id || null;
+      
+      // Remove :XX se existir (ex: 267955023654984:13@lid -> 267955023654984@lid)
+      if (id && id.includes(':')) {
+        const suffix = id.includes('@lid') ? '@lid' : '@s.whatsapp.net';
+        id = id.split(':')[0] + suffix;
+      }
+      
+      return id;
     };
 
-    const AllgroupMembers = !isGroup ? [] :
+    // Extrai IDs dos membros (pode estar em JID)
+    const rawMembers = !isGroup ? [] :
       groupMetadata.participants?.map(extractParticipantId).filter(Boolean) || [];
+    
+    // Extrai IDs dos admins (pode estar em JID)
+    const rawAdmins = !isGroup ? [] :
+      groupMetadata.participants?.filter(p => p.admin === 'admin' || p.admin === 'superadmin').map(extractParticipantId).filter(Boolean) || [];
 
-    const groupAdmins = !isGroup ? [] :
-      groupMetadata.participants?.filter(p => p.admin).map(extractParticipantId).filter(Boolean) || [];
+    // Converte todos os membros e admins para LID (usando cache)
+    const AllgroupMembers = await convertIdsToLid(nazu, rawMembers);
+    const groupAdmins = await convertIdsToLid(nazu, rawAdmins);
+    
+    // Debug log
+    debugLog('Membros e Admins convertidos:', {
+      totalMembros: AllgroupMembers.length,
+      totalAdmins: groupAdmins.length,
+      admins: groupAdmins.map(a => a?.substring(0, 20))
+    });
 
     // Robust bot ID extraction with multiple fallback mechanisms
-    const getBotNumber = async (nazu) => {
+    const getBotNumber = (nazu) => {
       try {
+        // Tenta pegar LID primeiro
         if (nazu.user?.lid) {
-          const botId = nazu.user.lid.split(':')[0];
-          return botId ? `${botId}@lid` : null;
+          // Remove o sufixo `:XX` se existir (ex: 267955023654984:13@lid -> 267955023654984@lid)
+          const lid = nazu.user.lid;
+          const cleanLid = lid.includes(':') ? lid.split(':')[0] + '@lid' : lid;
+          return cleanLid;
         }
+        
+        // Fallback para ID padrão
         if (nazu.user?.id) {
-          const botId = (await nazu.onWhatsApp(nazu.user.id.split(':')[0])).lid;
-          return botId ? `${botId}` : null;
-        }
-
-        if (typeof getBotId === 'function') {
-          return getBotId(nazu);
-        }
-
-        if (nazu.user?.id?.split) {
           const botId = nazu.user.id.split(':')[0];
           return `${botId}@s.whatsapp.net`;
+        }
+
+        // Usa helper se disponível
+        if (typeof getBotId === 'function') {
+          return getBotId(nazu);
         }
 
         console.warn('Unable to determine bot number - user object:', nazu.user);
@@ -727,12 +899,36 @@ async function NazuninhaBotExec(nazu, info, store, messagesCache, rentalExpirati
       }
     };
 
-    const botNumber = await getBotNumber(nazu);
-    const isBotAdmin = !isGroup || !botNumber ? false : groupAdmins.includes(botNumber);
+    const botNumber = getBotNumber(nazu);
+    
+    // Converte o botNumber para LID se for JID
+    const botNumberLid = botNumber && isValidJid(botNumber) 
+      ? await getLidFromJidCached(nazu, botNumber) 
+      : botNumber;
+    
+    const isBotAdmin = !isGroup || !botNumberLid ? false : idInArray(botNumberLid, groupAdmins);
+    
     let isGroupAdmin = false;
     if (isGroup) {
       const isModeratorActionAllowed = groupData.moderators?.includes(sender) && groupData.allowedModCommands?.includes(command);
-      isGroupAdmin = groupAdmins.includes(sender) || isOwner || isModeratorActionAllowed;
+      
+      // Usa a função idsMatch para comparação robusta
+      const isAdminMatch = idInArray(sender, groupAdmins);
+      
+      isGroupAdmin = isAdminMatch || isOwner || isModeratorActionAllowed;
+      
+      // Debug: log das verificações de admin
+      debugLog('Verificação de admin:', { 
+        sender: sender?.substring(0, 30),
+        senderBase: sender?.split('@')[0],
+        groupAdminsCount: groupAdmins.length,
+        groupAdmins: groupAdmins.map(a => a?.substring(0, 20)),
+        isAdminMatch,
+        isGroupAdmin,
+        isModerator: isModeratorActionAllowed,
+        isBotAdmin,
+        botNumber: botNumberLid?.substring(0, 30)
+      });
     }
     const isModoBn = groupData.modobrincadeira;
     const isOnlyAdmin = groupData.soadm;
@@ -782,33 +978,37 @@ async function NazuninhaBotExec(nazu, info, store, messagesCache, rentalExpirati
 };
 
     if (isGroup && isStatusMention && isAntiStatus && !isGroupAdmin) {
-      if (isBotAdmin) {
-        await nazu.sendMessage(from, {
-          delete: {
-            remoteJid: from,
-            fromMe: false,
-            id: info.key.id,
-            participant: sender
-          }
-        });
-        await nazu.groupParticipantsUpdate(from, [sender], 'remove');
-      } else {
-        await reply("⚠️ Não posso remover o usuário porque não sou administrador.");
+      if (!isUserWhitelisted(sender, 'antistatus')) {
+        if (isBotAdmin) {
+          await nazu.sendMessage(from, {
+            delete: {
+              remoteJid: from,
+              fromMe: false,
+              id: info.key.id,
+              participant: sender
+            }
+          });
+          await nazu.groupParticipantsUpdate(from, [sender], 'remove');
+        } else {
+          await reply("⚠️ Não posso remover o usuário porque não sou administrador.");
+        }
       }
     }
     if (isGroup && isButtonMessage && isAntiBtn && !isGroupAdmin) {
-      if (isBotAdmin) {
-        await nazu.sendMessage(from, {
-          delete: {
-            remoteJid: from,
-            fromMe: false,
-            id: info.key.id,
-            participant: sender
-          }
-        });
-        await nazu.groupParticipantsUpdate(from, [sender], 'remove');
-      } else {
-        await reply("⚠️ Não posso remover o usuário porque não sou administrador.");
+      if (!isUserWhitelisted(sender, 'antibtn')) {
+        if (isBotAdmin) {
+          await nazu.sendMessage(from, {
+            delete: {
+              remoteJid: from,
+              fromMe: false,
+              id: info.key.id,
+              participant: sender
+            }
+          });
+          await nazu.groupParticipantsUpdate(from, [sender], 'remove');
+        } else {
+          await reply("⚠️ Não posso remover o usuário porque não sou administrador.");
+        }
       }
     }
     if (isGroup && isCmd && isOnlyAdmin && !isGroupAdmin) {
@@ -1896,81 +2096,85 @@ Código: *${roleCode}*`,
       }
     }
     if (isGroup && isAntiPorn && !info.key.fromMe) {
-      const mediaInfo = getMediaInfo(info.message);
-      if (mediaInfo && mediaInfo.type === 'image') {
-        try {
-          const imageBuffer = await getFileBuffer(mediaInfo.media, 'image');
-          const mediaURL = await upload(imageBuffer, true);
-          if (mediaURL) {
-            const apiResponse = await axios.get(`https://nsfw-demo.sashido.io/api/image/classify?url=${encodeURIComponent(mediaURL)}`);
-            let scores = {
-              Porn: 0,
-              Hentai: 0
-            };
-            if (Array.isArray(apiResponse.data)) {
-              scores = apiResponse.data.reduce((acc, item) => {
-                if (item && typeof item.className === 'string' && typeof item.probability === 'number') {
-                  if (item.className === 'Porn' || item.className === 'Hentai') {
-                    acc[item.className] = Math.max(acc[item.className] || 0, item.probability);
-                  }
-                }
-                return acc;
-              }, {
+      if (!isGroupAdmin && !isUserWhitelisted(sender, 'antiporn')) {
+        const mediaInfo = getMediaInfo(info.message);
+        if (mediaInfo && mediaInfo.type === 'image') {
+          try {
+            const imageBuffer = await getFileBuffer(mediaInfo.media, 'image');
+            const mediaURL = await upload(imageBuffer, true);
+            if (mediaURL) {
+              const apiResponse = await axios.get(`https://nsfw-demo.sashido.io/api/image/classify?url=${encodeURIComponent(mediaURL)}`);
+              let scores = {
                 Porn: 0,
                 Hentai: 0
-              });
-            } else {
-              console.warn("Anti-porn API response format unexpected:", apiResponse.data);
-            }
-            const pornThreshold = 0.7;
-            const hentaiThreshold = 0.7;
-            const isPorn = scores.Porn >= pornThreshold;
-            const isHentai = scores.Hentai >= hentaiThreshold;
-            if (isPorn || isHentai) {
-              const reason = isPorn ? 'Pornografia' : 'Hentai';
-              await reply(`🚨 Conteúdo impróprio detectado! (${reason})`);
-              if (isBotAdmin) {
-                try {
-                  await nazu.sendMessage(from, {
-                    delete: info.key
-                  });
-                  await nazu.groupParticipantsUpdate(from, [sender], 'remove');
-                  await reply(`🔞 @${getUserName(sender)}, conteúdo impróprio detectado. Você foi removido do grupo.`, {
-                    mentions: [sender]
-                  });
-                } catch (adminError) {
-                  console.error(`Erro ao remover usuário por anti-porn: ${adminError}`);
-                  await reply(`⚠️ Não consegui remover @${getUserName(sender)} automaticamente após detectar conteúdo impróprio. Admins, por favor, verifiquem!`, {
+              };
+              if (Array.isArray(apiResponse.data)) {
+                scores = apiResponse.data.reduce((acc, item) => {
+                  if (item && typeof item.className === 'string' && typeof item.probability === 'number') {
+                    if (item.className === 'Porn' || item.className === 'Hentai') {
+                      acc[item.className] = Math.max(acc[item.className] || 0, item.probability);
+                    }
+                  }
+                  return acc;
+                }, {
+                  Porn: 0,
+                  Hentai: 0
+                });
+              } else {
+                console.warn("Anti-porn API response format unexpected:", apiResponse.data);
+              }
+              const pornThreshold = 0.7;
+              const hentaiThreshold = 0.7;
+              const isPorn = scores.Porn >= pornThreshold;
+              const isHentai = scores.Hentai >= hentaiThreshold;
+              if (isPorn || isHentai) {
+                const reason = isPorn ? 'Pornografia' : 'Hentai';
+                await reply(`🚨 Conteúdo impróprio detectado! (${reason})`);
+                if (isBotAdmin) {
+                  try {
+                    await nazu.sendMessage(from, {
+                      delete: info.key
+                    });
+                    await nazu.groupParticipantsUpdate(from, [sender], 'remove');
+                    await reply(`🔞 @${getUserName(sender)}, conteúdo impróprio detectado. Você foi removido do grupo.`, {
+                      mentions: [sender]
+                    });
+                  } catch (adminError) {
+                    console.error(`Erro ao remover usuário por anti-porn: ${adminError}`);
+                    await reply(`⚠️ Não consegui remover @${getUserName(sender)} automaticamente após detectar conteúdo impróprio. Admins, por favor, verifiquem!`, {
+                      mentions: [sender]
+                    });
+                  }
+                } else {
+                  await reply(`@${getUserName(sender)} enviou conteúdo impróprio (${reason}), mas não posso removê-lo sem ser admin.`, {
                     mentions: [sender]
                   });
                 }
-              } else {
-                await reply(`@${getUserName(sender)} enviou conteúdo impróprio (${reason}), mas não posso removê-lo sem ser admin.`, {
-                  mentions: [sender]
-                });
               }
+            } else {
+              console.warn("Falha no upload da imagem para verificação anti-porn.");
             }
-          } else {
-            console.warn("Falha no upload da imagem para verificação anti-porn.");
+          } catch (error) {
+            console.error("Erro na verificação anti-porn:", error);
           }
-        } catch (error) {
-          console.error("Erro na verificação anti-porn:", error);
         }
       }
     }
     if (isGroup && groupData.antiloc && !isGroupAdmin && type === 'locationMessage') {
-      await nazu.sendMessage(from, {
-        delete: {
-          remoteJid: from,
-          fromMe: false,
-          id: info.key.id,
-          participant: sender
-        }
-      });
-      await nazu.groupParticipantsUpdate(from, [sender], 'remove');
-      await reply(`🗺️ @${getUserName(sender)}, localização não permitida. Você foi removido do grupo.`, {
-        mentions: [sender]
-      });
+      if (!isUserWhitelisted(sender, 'antiloc')) {
+        await nazu.sendMessage(from, {
+          delete: {
+            remoteJid: from,
+            fromMe: false,
+            id: info.key.id,
+            participant: sender
+          }
+        });
+        await nazu.groupParticipantsUpdate(from, [sender], 'remove');
+        await reply(`🗺️ @${getUserName(sender)}, localização não permitida. Você foi removido do grupo.`, {
+          mentions: [sender]
+        });
+      }
     }
     if (isGroup && antifloodData[from]?.enabled && isCmd && !isGroupAdmin) {
       antifloodData[from].users = antifloodData[from].users || {};
@@ -1986,18 +2190,20 @@ Código: *${roleCode}*`,
       writeJsonFile(pathz.join(DATABASE_DIR, 'antiflood.json'), antifloodData);
     }
     if (isGroup && groupData.antidoc && !isGroupAdmin && (type === 'documentMessage' || type === 'documentWithCaptionMessage')) {
-      await nazu.sendMessage(from, {
-        delete: {
-          remoteJid: from,
-          fromMe: false,
-          id: info.key.id,
-          participant: sender
-        }
-      });
-      await nazu.groupParticipantsUpdate(from, [sender], 'remove');
-      await reply(`📄 @${getUserName(sender)}, documentos não são permitidos. Você foi removido do grupo.`, {
-        mentions: [sender]
-      });
+      if (!isUserWhitelisted(sender, 'antidoc')) {
+        await nazu.sendMessage(from, {
+          delete: {
+            remoteJid: from,
+            fromMe: false,
+            id: info.key.id,
+            participant: sender
+          }
+        });
+        await nazu.groupParticipantsUpdate(from, [sender], 'remove');
+        await reply(`📄 @${getUserName(sender)}, documentos não são permitidos. Você foi removido do grupo.`, {
+          mentions: [sender]
+        });
+      }
     }
     
     if (isGroup && groupData.autodl && budy2.includes('http') && !isCmd) {
@@ -2038,28 +2244,30 @@ Código: *${roleCode}*`,
       }
     }
     if (isGroup && groupData.antilinkhard && !isGroupAdmin && budy2.includes('http') && !isOwner) {
-      try {
-        await nazu.sendMessage(from, {
-          delete: {
-            remoteJid: from,
-            fromMe: false,
-            id: info.key.id,
-            participant: sender
+      if (!isUserWhitelisted(sender, 'antilinkhard')) {
+        try {
+          await nazu.sendMessage(from, {
+            delete: {
+              remoteJid: from,
+              fromMe: false,
+              id: info.key.id,
+              participant: sender
+            }
+          });
+          if (isBotAdmin) {
+            await nazu.groupParticipantsUpdate(from, [sender], 'remove');
+            await reply(`🔗 @${getUserName(sender)}, links não são permitidos. Você foi removido do grupo.`, {
+              mentions: [sender]
+            });
+          } else {
+            await reply(`🔗 Atenção, @${getUserName(sender)}! Links não são permitidos. Não consigo remover você, mas evite enviar links.`, {
+              mentions: [sender]
+            });
           }
-        });
-        if (isBotAdmin) {
-          await nazu.groupParticipantsUpdate(from, [sender], 'remove');
-          await reply(`🔗 @${getUserName(sender)}, links não são permitidos. Você foi removido do grupo.`, {
-            mentions: [sender]
-          });
-        } else {
-          await reply(`🔗 Atenção, @${getUserName(sender)}! Links não são permitidos. Não consigo remover você, mas evite enviar links.`, {
-            mentions: [sender]
-          });
+          return;
+        } catch (error) {
+          console.error("Erro no sistema antilink hard:", error);
         }
-        return;
-      } catch (error) {
-        console.error("Erro no sistema antilink hard:", error);
       }
     }
     let quotedMessageContent = null;
@@ -2134,47 +2342,49 @@ Código: *${roleCode}*`,
     }
 
     if (isGroup && isAntiLinkGp && !isGroupAdmin) {
-      let foundGroupLink = false;
-      let link_dgp = null;
-      try {
-        if (budy2.includes('chat.whatsapp.com')) {
-          foundGroupLink = true;
-          link_dgp = await nazu.groupInviteCode(from);
-          if (budy2.includes(link_dgp)) foundGroupLink = false;
-        }
-        if (!foundGroupLink && info.message?.requestPaymentMessage) {
-          const paymentText = info.message.requestPaymentMessage?.noteMessage?.extendedTextMessage?.text || '';
-          if (paymentText.includes('chat.whatsapp.com')) {
+      if (!isUserWhitelisted(sender, 'antilinkgp')) {
+        let foundGroupLink = false;
+        let link_dgp = null;
+        try {
+          if (budy2.includes('chat.whatsapp.com')) {
             foundGroupLink = true;
-            link_dgp = link_dgp || await nazu.groupInviteCode(from);
-            if (paymentText.includes(link_dgp)) foundGroupLink = false;
+            link_dgp = await nazu.groupInviteCode(from);
+            if (budy2.includes(link_dgp)) foundGroupLink = false;
           }
-        }
-        if (foundGroupLink) {
-          if (isOwner) return;
-          await nazu.sendMessage(from, {
-            delete: {
-              remoteJid: from,
-              fromMe: false,
-              id: info.key.id,
-              participant: sender
+          if (!foundGroupLink && info.message?.requestPaymentMessage) {
+            const paymentText = info.message.requestPaymentMessage?.noteMessage?.extendedTextMessage?.text || '';
+            if (paymentText.includes('chat.whatsapp.com')) {
+              foundGroupLink = true;
+              link_dgp = link_dgp || await nazu.groupInviteCode(from);
+              if (paymentText.includes(link_dgp)) foundGroupLink = false;
             }
-          });
-          if (!AllgroupMembers.includes(sender)) return;
-          if (isBotAdmin) {
-            await nazu.groupParticipantsUpdate(from, [sender], 'remove');
-            await reply(`🔗 @${getUserName(sender)}, links de outros grupos não são permitidos. Você foi removido do grupo.`, {
-              mentions: [sender]
-            });
-          } else {
-            await reply(`🔗 Atenção, @${getUserName(sender)}! Links de outros grupos não são permitidos. Não consigo remover você, mas evite compartilhar esses links.`, {
-              mentions: [sender]
-            });
           }
-          return;
+          if (foundGroupLink) {
+            if (isOwner) return;
+            await nazu.sendMessage(from, {
+              delete: {
+                remoteJid: from,
+                fromMe: false,
+                id: info.key.id,
+                participant: sender
+              }
+            });
+            if (!AllgroupMembers.includes(sender)) return;
+            if (isBotAdmin) {
+              await nazu.groupParticipantsUpdate(from, [sender], 'remove');
+              await reply(`🔗 @${getUserName(sender)}, links de outros grupos não são permitidos. Você foi removido do grupo.`, {
+                mentions: [sender]
+              });
+            } else {
+              await reply(`🔗 Atenção, @${getUserName(sender)}! Links de outros grupos não são permitidos. Não consigo remover você, mas evite compartilhar esses links.`, {
+                mentions: [sender]
+              });
+            }
+            return;
+          }
+        } catch (error) {
+          console.error("Erro no sistema antilink de grupos:", error);
         }
-      } catch (error) {
-        console.error("Erro no sistema antilink de grupos:", error);
       }
     }
   const botStateFile = pathz.join(DATABASE_DIR, 'botState.json');
@@ -2212,16 +2422,30 @@ Código: *${roleCode}*`,
         if (relationshipManager.hasPendingRequest(from) && body) {
           const relResponse = relationshipManager.processResponse(from, sender, body);
           if (relResponse) {
+            // Apenas envia mensagem se for sucesso, ignora respostas inválidas
             if (relResponse.success && relResponse.message) {
               await nazu.sendMessage(from, {
                 text: relResponse.message,
                 mentions: relResponse.mentions || []
               });
-            } else if (relResponse.reason === 'invalid_response' && relResponse.message) {
-              await reply(relResponse.message);
             }
           }
         }
+        
+        // Processa resposta de traição
+        if (relationshipManager.hasPendingBetrayal(from) && body) {
+          const betrayalResponse = relationshipManager.processBetrayalResponse(from, sender, body, groupPrefix);
+          if (betrayalResponse) {
+            // Apenas envia mensagem se for sucesso, ignora respostas inválidas
+            if (betrayalResponse.success && betrayalResponse.message) {
+              await nazu.sendMessage(from, {
+                text: betrayalResponse.message,
+                mentions: betrayalResponse.mentions || []
+              });
+            }
+          }
+        }
+        
         if (tictactoe.hasPendingInvitation(from) && budy2) {
           const normalizedResponse = budy2.toLowerCase().trim();
           const result = tictactoe.processInvitationResponse(from, sender, normalizedResponse);
@@ -2284,11 +2508,13 @@ Código: *${roleCode}*`,
       commandStats.trackCommandUsage(command, sender);
     }
     if (budy2.match(/^(\d+)d(\d+)$/)) reply(+budy2.match(/^(\d+)d(\d+)$/)[1] > 50 || +budy2.match(/^(\d+)d(\d+)$/)[2] > 100 ? "❌ Limite: max 50 dados e 100 lados" : "🎲 Rolando " + budy2.match(/^(\d+)d(\d+)$/)[1] + "d" + budy2.match(/^(\d+)d(\d+)$/)[2] + "...\n🎯 Resultados: " + (r = [...Array(+budy2.match(/^(\d+)d(\d+)$/)[1])].map(_ => 1 + Math.floor(Math.random() * +budy2.match(/^(\d+)d(\d+)$/)[2]))).join(", ") + "\n📊 Total: " + r.reduce((a, b) => a + b, 0));
-    if (!info.key.fromMe && isAssistente && !isCmd && (budy2.includes(nazu.user.id.split(':')[0]) || (budy2.includes(nazu.user.lid.split(':')[0])) || menc_os2 && menc_os2 == await getBotNumber(nazu)) && KeyCog) {
-      if (budy2.replaceAll('@' + nazu.user.id.split(':')[0], '').length > 2) {
+
+    const _botShort = (nazu && nazu.user && (nazu.user.id || nazu.user.lid)) ? String((nazu.user.id || nazu.user.lid).split(':')[0]) : '';
+    if (!info.key.fromMe && isAssistente && !isCmd && ((_botShort && budy2.includes(_botShort)) || (menc_os2 && menc_os2 == await getBotNumber(nazu))) && KeyCog) {
+      if (budy2.replaceAll('@' + _botShort, '').length > 2) {
         try {
           const jSoNzIn = {
-            texto: budy2.replaceAll('@' + nazu.user.id.split(':')[0], '').trim(),
+            texto: budy2.replaceAll('@' + _botShort, '').trim(),
             id_enviou: sender,
             nome_enviou: pushname,
             id_grupo: isGroup ? from : false,
@@ -2430,40 +2656,42 @@ Código: *${roleCode}*`,
     }
     //ANTI FIGURINHAS
     if (isGroup && groupData.antifig && groupData.antifig.enabled && type === "stickerMessage" && !isGroupAdmin && !info.key.fromMe) {
-      try {
-        await nazu.sendMessage(from, {
-          delete: {
-            remoteJid: from,
-            fromMe: false,
-            id: info.key.id,
-            participant: sender
+      if (!isUserWhitelisted(sender, 'antifig')) {
+        try {
+          await nazu.sendMessage(from, {
+            delete: {
+              remoteJid: from,
+              fromMe: false,
+              id: info.key.id,
+              participant: sender
+            }
+          });
+          groupData.warnings = groupData.warnings || {};
+          groupData.warnings[sender] = groupData.warnings[sender] || {
+            count: 0,
+            lastWarned: null
+          };
+          groupData.warnings[sender].count += 1;
+          groupData.warnings[sender].lastWarned = new Date().toISOString();
+          const warnCount = groupData.warnings[sender].count;
+          const warnLimit = groupData.antifig.warnLimit || 3;
+          let warnMessage = `🚫 @${getUserName(sender)}, figurinhas não são permitidas neste grupo! Advertência ${warnCount}/${warnLimit}.`;
+          if (warnCount >= warnLimit && isBotAdmin) {
+            warnMessage += `\n⚠️ Você atingiu o limite de advertências e será removido.`;
+            await nazu.groupParticipantsUpdate(from, [sender], 'remove');
+            delete groupData.warnings[sender];
           }
-        });
-        groupData.warnings = groupData.warnings || {};
-        groupData.warnings[sender] = groupData.warnings[sender] || {
-          count: 0,
-          lastWarned: null
-        };
-        groupData.warnings[sender].count += 1;
-        groupData.warnings[sender].lastWarned = new Date().toISOString();
-        const warnCount = groupData.warnings[sender].count;
-        const warnLimit = groupData.antifig.warnLimit || 3;
-        let warnMessage = `🚫 @${getUserName(sender)}, figurinhas não são permitidas neste grupo! Advertência ${warnCount}/${warnLimit}.`;
-        if (warnCount >= warnLimit && isBotAdmin) {
-          warnMessage += `\n⚠️ Você atingiu o limite de advertências e será removido.`;
-          await nazu.groupParticipantsUpdate(from, [sender], 'remove');
-          delete groupData.warnings[sender];
+          await nazu.sendMessage(from, {
+            text: warnMessage,
+            mentions: [sender]
+          });
+    writeJsonFile(groupFile, groupData);
+        } catch (error) {
+          console.error("Erro no sistema antifig:", error);
+          await reply(`⚠️ Erro ao processar antifig para @${getUserName(sender)}. Administradores, verifiquem!`, {
+            mentions: [sender]
+          });
         }
-        await nazu.sendMessage(from, {
-          text: warnMessage,
-          mentions: [sender]
-        });
-  writeJsonFile(groupFile, groupData);
-      } catch (error) {
-        console.error("Erro no sistema antifig:", error);
-        await reply(`⚠️ Erro ao processar antifig para @${getUserName(sender)}. Administradores, verifiquem!`, {
-          mentions: [sender]
-        });
       }
     }
     if (!isCmd) {
@@ -2472,6 +2700,15 @@ Código: *${roleCode}*`,
       if (matchedCommand) {
         var command = matchedCommand.command;
         var isCmd = true;
+        const bodyParts = body.trim().split(/ +/);
+        const dynamicArgs = bodyParts.slice(1);
+        const fixedParams = matchedCommand.fixedParams || '';
+        const allParams = fixedParams ? (fixedParams + (dynamicArgs.length > 0 ? ' ' + dynamicArgs.join(' ') : '')) : dynamicArgs.join(' ');
+        args.length = 0;
+        if (allParams) {
+          args.push(...allParams.split(/ +/));
+        }
+        q = allParams;
       }
     }
 
@@ -2558,6 +2795,28 @@ Código: *${roleCode}*`,
       const globalLimitCheck = checkCommandLimit(command, sender);
       if (globalLimitCheck.limited) {
         return reply(globalLimitCheck.message);
+      }
+    }
+
+    // Verificação de comandos VIP
+    if (isCmd && vipCommandsManager.isVipCommand(command)) {
+      if (!isPremium) {
+        await reply(`🔒 *Comando VIP Exclusivo*
+
+Este comando está disponível apenas para usuários VIP/Premium!
+
+💎 *Benefícios VIP:*
+• Acesso a comandos exclusivos
+• Sem limites de uso
+• Prioridade no atendimento
+• Recursos premium
+
+📞 *Como ser VIP?*
+Entre em contato com o dono do bot:
+• Use: ${prefix}dono
+
+✨ Use ${prefix}menuvip para ver todos os comandos VIP disponíveis!`);
+        return;
       }
     }
 
@@ -3479,6 +3738,22 @@ Código: *${roleCode}*`,
   case 'crime':
       case 'assaltar':
       case 'roubar':
+      case 'cozinhar':
+      case 'cook':
+      case 'receitas':
+      case 'plantar':
+      case 'plant':
+      case 'farm':
+      case 'colher':
+      case 'harvest':
+      case 'plantacao':
+      case 'plantação':
+      case 'horta':
+      case 'comer':
+      case 'eat':
+      case 'vendercomida':
+      case 'ingredientes':
+      case 'sementes':
       case 'toprpg':
       case 'diario':
       case 'daily':
@@ -3516,105 +3791,162 @@ Código: *${roleCode}*`,
 
         if (sub === 'perfilrpg' || sub === 'carteira') {
           const total = (me.wallet||0) + (me.bank||0);
-          return reply(`👤 Perfil Financeiro
-💼 Carteira: ${fmt(me.wallet)}
-🏦 Banco: ${fmt(me.bank)}
-💠 Total: ${fmt(total)}
- 💼 Emprego: ${me.job ? econ.jobCatalog[me.job]?.name || me.job : 'Desempregado(a)'}
-`);
+          return reply(`╭━━━⊱ 👤 *PERFIL FINANCEIRO* 👤 ⊱━━━╮
+│
+│ � *Carteira:* ${fmt(me.wallet)}
+│ 🏦 *Banco:* ${fmt(me.bank)}
+│ � *Total:* ${fmt(total)}
+│
+│ 💼 *Emprego:* ${me.job ? econ.jobCatalog[me.job]?.name || me.job : 'Desempregado(a)'}
+│
+╰━━━━━━━━━━━━━━━━━━━━━━━━━╯`);
         }
         if (sub === 'banco') {
           const cap = isFinite(bankCapacity) ? bankCapacity : '∞';
-          return reply(`🏦 Banco
-Saldo: ${fmt(me.bank)}
-Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
-`);
+          return reply(`╭━━━⊱ 🏦 *BANCO* 🏦 ⊱━━━╮
+│
+│ 💰 *Saldo:* ${fmt(me.bank)}
+│ 📦 *Capacidade:* ${cap === '∞' ? 'Ilimitada' : fmt(cap)}
+│
+╰━━━━━━━━━━━━━━━━━━━━━╯`);
         }
 
         if (sub === 'depositar' || sub === 'dep') {
           const amount = parseAmount(q.split(' ')[0], me.wallet);
-          if (!isFinite(amount) || amount <= 0) return reply('Informe um valor válido (ou "all").');
-          if (amount > me.wallet) return reply('Você não tem tudo isso na carteira.');
+          if (!isFinite(amount) || amount <= 0) return reply('❌ Informe um valor válido (ou "all").');
+          if (amount > me.wallet) return reply('❌ Você não tem tudo isso na carteira.');
           const cap = isFinite(bankCapacity) ? bankCapacity : Infinity;
           const space = cap - me.bank;
-          if (space <= 0) return reply('Seu banco está cheio. Compre um Cofre na loja para aumentar a capacidade.');
+          if (space <= 0) return reply('⚠️ Seu banco está cheio. Compre um Cofre na loja para aumentar a capacidade.');
           const toDep = Math.min(amount, space);
           me.wallet -= toDep; me.bank += toDep;
           saveEconomy(econ);
-          return reply(`✅ Depositado ${fmt(toDep)}. Banco: ${fmt(me.bank)} | Carteira: ${fmt(me.wallet)}`);
+          return reply(`╭━━━⊱ 💰 *DEPÓSITO* 💰 ⊱━━━╮
+│
+│ ✅ Depositado: ${fmt(toDep)}
+│
+│ 🏦 Banco: ${fmt(me.bank)}
+│ 💼 Carteira: ${fmt(me.wallet)}
+│
+╰━━━━━━━━━━━━━━━━━━━━━╯`);
         }
         if (sub === 'sacar' || sub === 'saque') {
           const amount = parseAmount(q.split(' ')[0], me.bank);
-          if (!isFinite(amount) || amount <= 0) return reply('Informe um valor válido (ou "all").');
-          if (amount > me.bank) return reply('Saldo insuficiente no banco.');
+          if (!isFinite(amount) || amount <= 0) return reply('❌ Informe um valor válido (ou "all").');
+          if (amount > me.bank) return reply('❌ Saldo insuficiente no banco.');
           me.bank -= amount; me.wallet += amount;
           saveEconomy(econ);
-          return reply(`✅ Sacado ${fmt(amount)}. Banco: ${fmt(me.bank)} | Carteira: ${fmt(me.wallet)}`);
+          return reply(`╭━━━⊱ 💳 *SAQUE* 💳 ⊱━━━╮
+│
+│ ✅ Sacado: ${fmt(amount)}
+│
+│ 🏦 Banco: ${fmt(me.bank)}
+│ 💼 Carteira: ${fmt(me.wallet)}
+│
+╰━━━━━━━━━━━━━━━━━━━━━╯`);
         }
 
         if (sub === 'transferir' || sub === 'pix') {
-          if (!mentioned) return reply(`👥 *Transferência de recursos*\n\n.Marque um usuário e informe o valor.\n📝 *Exemplo:* ${prefix}${sub} @user 100`);
+          if (!mentioned) return reply(`╭━━━⊱ � *TRANSFERÊNCIA* 💸 ⊱━━━╮
+│
+│ 👥 Marque um usuário e informe
+│    o valor a transferir
+│
+│ 📝 *Exemplo:*
+│ ${prefix}${sub} @user 100
+│
+╰━━━━━━━━━━━━━━━━━━━━━━━╯`);
           const amount = parseAmount(args.slice(-1)[0], me.wallet);
-          if (!isFinite(amount) || amount <= 0) return reply('Informe um valor válido.');
-          if (amount > me.wallet) return reply('Você não tem esse valor na carteira.');
+          if (!isFinite(amount) || amount <= 0) return reply('❌ Informe um valor válido.');
+          if (amount > me.wallet) return reply('❌ Você não tem esse valor na carteira.');
           const other = getEcoUser(econ, mentioned);
-          if (mentioned === sender) return reply('Você não pode transferir para si mesmo.');
+          if (mentioned === sender) return reply('❌ Você não pode transferir para si mesmo.');
           me.wallet -= amount; other.wallet += amount;
           saveEconomy(econ);
-          return reply(`💸 Transferido ${fmt(amount)} para @${getUserName(mentioned)}.`, { mentions:[mentioned] });
+          return reply(`╭━━━⊱ ✅ *TRANSFERÊNCIA* ✅ ⊱━━━╮
+│
+│ 💸 Transferido: ${fmt(amount)}
+│ 👤 Para: @${getUserName(mentioned)}
+│
+╰━━━━━━━━━━━━━━━━━━━━━━━━╯`, { mentions:[mentioned] });
         }
 
         if (sub === 'loja' || sub === 'lojarps') {
           const items = Object.entries(econ.shop||{});
-          if (items.length === 0) return reply('A loja está vazia no momento.');
-          let text = '🛍️ Loja de Itens\n\n';
+          if (items.length === 0) return reply('❌ A loja está vazia no momento.');
+          let text = '╭━━━⊱ 🛍️ *LOJA DE ITENS* 🛍️ ⊱━━━╮\n│\n';
           for (const [k, it] of items) {
-            text += `• ${k} — ${it.name} — ${fmt(it.price)}\n`;
+            text += `│ 🔹 *${k}*\n│   ${it.name} — ${fmt(it.price)}\n│\n`;
           }
-          text += `\nCompre com: ${prefix}comprar <item>`;
+          text += `╰━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n💡 Compre com: ${prefix}comprar <item>`;
           return reply(text);
         }
         if (sub === 'comprar' || sub === 'buy') {
           const key = (args[0]||'').toLowerCase();
-          if (!key) return reply('Informe o item. Ex: '+prefix+'comprar pickaxe_bronze');
+          if (!key) return reply(`╭━━━⊱ 🛒 *COMPRAR* 🛒 ⊱━━━╮
+│
+│ ❌ Informe o item desejado
+│
+│ 📝 *Exemplo:*
+│ ${prefix}comprar pickaxe_bronze
+│
+│ 🛍️ Ver loja: ${prefix}loja
+│
+╰━━━━━━━━━━━━━━━━━━━━╯`);
           const it = (econ.shop||{})[key];
-          if (!it) return reply('Item não encontrado. Veja a loja com '+prefix+'loja');
-          if (me.wallet < it.price) return reply('Saldo insuficiente na carteira.');
+          if (!it) return reply(`❌ Item não encontrado.\n\n🛍️ Veja a loja com ${prefix}loja`);
+          if (me.wallet < it.price) return reply('❌ Saldo insuficiente na carteira.');
           me.wallet -= it.price;
           // Se for ferramenta (picareta), equipa automaticamente
           if (it.type === 'tool' && it.toolType === 'pickaxe') {
             me.tools = me.tools || {};
             me.tools.pickaxe = { tier: it.tier, dur: it.durability, max: it.durability, key };
             saveEconomy(econ);
-            return reply(`✅ Você comprou e equipou ${it.name} (durabilidade ${it.durability}).`);
+            return reply(`╭━━━⊱ ✅ *COMPRA* ✅ ⊱━━━╮
+│
+│ 🛠️ Você comprou e equipou:
+│ ${it.name}
+│
+│ ⚙️ Durabilidade: ${it.durability}
+│
+╰━━━━━━━━━━━━━━━━━━━━╯`);
           }
           // Caso contrário, vai para o inventário
           me.inventory[key] = (me.inventory[key]||0)+1;
           saveEconomy(econ);
-          return reply(`✅ Você comprou ${it.name} por ${fmt(it.price)}!`);
+          return reply(`╭━━━⊱ ✅ *COMPRA* ✅ ⊱━━━╮
+│
+│ 🎒 Você comprou:
+│ ${it.name}
+│
+│ 💰 Preço: ${fmt(it.price)}
+│
+╰━━━━━━━━━━━━━━━━━━━━╯`);
         }
 
         if (sub === 'inventario' || sub === 'inv') {
           const entries = Object.entries(me.inventory||{}).filter(([,q])=>q>0);
-          let text = '🎒 Inventário\n\n';
+          let text = '╭━━━⊱ 🎒 *INVENTÁRIO* 🎒 ⊱━━━╮\n│\n';
           if (entries.length>0) {
             for (const [k,q] of entries) {
               const it = (econ.shop||{})[k];
-              text += `• ${it?.name || k} x${q}\n`;
+              text += `│ 📦 ${it?.name || k} x${q}\n`;
             }
           } else {
-            text += '• (vazio)\n';
+            text += '│ 📭 (vazio)\n';
           }
+          text += '│\n';
           // Ferramentas
           const pk = me.tools?.pickaxe;
-          text += '\n🛠️ Ferramentas\n';
+          text += '╠━━━⊱ 🛠️ *FERRAMENTAS* 🛠️ ⊱━━━╣\n│\n';
           if (pk) {
             const tierName = pk.tier || 'desconhecida';
             const dur = pk.dur ?? 0; const max = pk.max ?? (pk.tier==='bronze'?20:pk.tier==='ferro'?60:pk.tier==='diamante'?150:0);
-            text += `• Picareta ${tierName} — ${dur}/${max}\n`;
+            text += `│ ⛏️ Picareta ${tierName}\n│    Durabilidade: ${dur}/${max}\n`;
           } else {
-            text += '• Picareta — nenhuma\n';
+            text += '│ ⛏️ Picareta — nenhuma\n';
           }
+          text += '│\n╰━━━━━━━━━━━━━━━━━━━━━━━━╯';
           return reply(text);
         }
 
@@ -3622,49 +3954,80 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         if (sub === 'materiais') {
           const mats = me.materials || {};
           const keys = Object.keys(mats).filter(k=>mats[k]>0);
-          if (keys.length===0) return reply('⛏️ Você não possui materiais. Mine para coletar.');
-          let text = '⛏️ Materiais\n\n';
-          for (const k of keys) text += `• ${k}: ${mats[k]}\n`;
+          if (keys.length===0) return reply('╭━━━⊱ ⛏️ *MATERIAIS* ⛏️ ⊱━━━╮\n│\n│ 📭 Você não possui materiais\n│\n│ ⛏️ Mine para coletar!\n│ Use: '+prefix+'minerar\n│\n╰━━━━━━━━━━━━━━━━━━━━━━╯');
+          let text = '╭━━━⊱ ⛏️ *MATERIAIS* ⛏️ ⊱━━━╮\n│\n';
+          for (const k of keys) text += `│ 💎 ${k}: ${mats[k]}\n`;
+          text += '│\n╰━━━━━━━━━━━━━━━━━━━━━━╯';
           return reply(text);
         }
         if (sub === 'precos' || sub === 'preços') {
           const mp = econ.materialsPrices || {};
-          let text = '💱 Preço dos Materiais (unidade)\n\n';
-          for (const [k,v] of Object.entries(mp)) text += `• ${k}: ${fmt(v)}\n`;
+          let text = '╭━━━⊱ 💱 *PREÇOS* 💱 ⊱━━━╮\n│\n│ 💎 *MATERIAIS (unidade)*\n│\n';
+          for (const [k,v] of Object.entries(mp)) text += `│ 🔸 ${k}: ${fmt(v)}\n`;
           // Receitas básicas
           const r = econ.recipes || {};
           if (Object.keys(r).length>0) {
-            text += '\n📜 Receitas\n';
+            text += '│\n│ 📜 *RECEITAS*\n│\n';
             for (const [key,rec] of Object.entries(r)) {
               const shopItem = econ.shop?.[key];
               const name = shopItem?.name || key;
               const req = Object.entries(rec.requires||{}).map(([mk,mq])=>`${mk} x${mq}`).join(', ');
-              text += `• ${name}: ${req} + ${fmt(rec.gold||0)} gold\n`;
+              text += `│ 🔨 ${name}\n│    ${req} + ${fmt(rec.gold||0)}\n`;
             }
           }
+          text += '│\n╰━━━━━━━━━━━━━━━━━━━━━━━━╯';
           return reply(text);
         }
         if (sub === 'vender') {
           const matKey = (args[0]||'').toLowerCase();
-          if (!matKey) return reply(`Use: ${prefix}vender <material> <quantidade|all>`);
+          if (!matKey) return reply(`╭━━━⊱ 💰 *VENDER MATERIAIS* 💰 ⊱━━━╮
+│
+│ 📝 *Uso:*
+│ ${prefix}vender <material> <qtd|all>
+│
+│ 💡 *Exemplo:*
+│ ${prefix}vender ferro 10
+│ ${prefix}vender ouro all
+│
+│ 💱 Ver preços: ${prefix}precos
+│
+╰━━━━━━━━━━━━━━━━━━━━━━━━━╯`);
           const price = (econ.materialsPrices||{})[matKey];
-          if (!price) return reply('Material inválido. Veja preços com '+prefix+'precos');
+          if (!price) return reply(`❌ Material inválido.\n\n💱 Veja preços com ${prefix}precos`);
           const have = me.materials?.[matKey] || 0;
-          if (have<=0) return reply('Você não possui esse material.');
+          if (have<=0) return reply('❌ Você não possui esse material.');
           const qtyArg = args[1]||'all';
           const qty = ['all','tudo','max'].includes((qtyArg||'').toLowerCase()) ? have : parseAmount(qtyArg, have);
-          if (!isFinite(qty) || qty<=0) return reply('Quantidade inválida.');
+          if (!isFinite(qty) || qty<=0) return reply('❌ Quantidade inválida.');
           const gain = qty * price;
           me.materials[matKey] = have - qty;
           me.wallet += gain;
           saveEconomy(econ);
-          return reply(`💰 Você vendeu ${qty}x ${matKey} por ${fmt(gain)}.`);
+          return reply(`╭━━━⊱ ✅ *VENDA* ✅ ⊱━━━╮
+│
+│ � Vendeu: ${qty}x ${matKey}
+│ 💰 Ganhou: ${fmt(gain)}
+│
+╰━━━━━━━━━━━━━━━━━━━━━╯`);
         }
         if (sub === 'reparar') {
           const pk = getActivePickaxe(me) || me.tools?.pickaxe;
-          if (!pk) return reply('Você não tem picareta equipada. Compre uma na '+prefix+'loja.');
+          if (!pk) return reply(`╭━━━⊱ 🛠️ *REPARAR* 🛠️ ⊱━━━╮
+│
+│ ❌ Você não tem picareta equipada
+│
+│ 🛍️ Compre uma: ${prefix}loja
+│
+╰━━━━━━━━━━━━━━━━━━━━━━╯`);
           const kits = me.inventory?.repairkit || 0;
-          if (kits<=0) return reply(`Você não tem Kit de Reparos. Compre com ${prefix}comprar repairkit.`);
+          if (kits<=0) return reply(`╭━━━⊱ 🔧 *KIT DE REPAROS* 🔧 ⊱━━━╮
+│
+│ ❌ Você não tem Kit de Reparos
+│
+│ 🛒 Compre com:
+│ ${prefix}comprar repairkit
+│
+╰━━━━━━━━━━━━━━━━━━━━━━━━╯`);
           const repair = econ.shop?.repairkit?.effect?.repair || 40;
           const max = pk.max ?? (pk.tier==='bronze'?20:pk.tier==='ferro'?60:pk.tier==='diamante'?150:pk.dur);
           const before = pk.dur;
@@ -3672,28 +4035,42 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           me.inventory.repairkit = kits - 1;
           me.tools.pickaxe = { ...pk, max };
           saveEconomy(econ);
-          return reply(`🛠️ Picareta reparada: ${before} ➜ ${pk.dur}/${max}.`);
+          return reply(`╭━━━⊱ 🛠️ *REPARADO!* 🛠️ ⊱━━━╮
+│
+│ ⛏️ Picareta reparada
+│ 📊 ${before} ➜ ${pk.dur}/${max}
+│
+│ 🔧 Kits restantes: ${kits - 1}
+│
+╰━━━━━━━━━━━━━━━━━━━━━━━╯`);
         }
         if (sub === 'desafio') {
           ensureUserChallenge(me);
           const ch = me.challenge;
           if ((args[0]||'').toLowerCase()==='coletar') {
-            if (ch.claimed) return reply('Você já coletou a recompensa de hoje.');
-            if (!isChallengeCompleted(me)) return reply('Complete todas as tarefas diárias para coletar.');
+            if (ch.claimed) return reply('❌ Você já coletou a recompensa de hoje.');
+            if (!isChallengeCompleted(me)) return reply('❌ Complete todas as tarefas diárias para coletar.');
             me.wallet += ch.reward;
             ch.claimed = true;
             saveEconomy(econ);
-            return reply(`🎉 Recompensa diária coletada: ${fmt(ch.reward)}!`);
+            return reply(`╭━━━⊱ 🎉 *RECOMPENSA!* 🎉 ⊱━━━╮
+│
+│ ✅ Desafio diário concluído!
+│ 💰 Recompensa: ${fmt(ch.reward)}
+│
+╰━━━━━━━━━━━━━━━━━━━━━━━━╯`);
           }
           const labels = {
             mine: 'Minerações', work:'Trabalhos', fish:'Pescarias', explore:'Explorações', hunt:'Caçadas', crimeSuccess:'Crimes bem-sucedidos'
           };
-          let text = '🏅 Desafio Diário\n\n';
+          let text = '╭━━━⊱ 🏅 *DESAFIO DIÁRIO* 🏅 ⊱━━━╮\n│\n';
           for (const t of ch.tasks||[]) {
-            text += `• ${labels[t.type]||t.type}: ${t.progress||0}/${t.target}\n`;
+            text += `│ 📋 ${labels[t.type]||t.type}\n│    ${t.progress||0}/${t.target}\n`;
           }
-          text += `\nPrêmio: ${fmt(ch.reward)} ${ch.claimed?'(coletado)':''}`;
-          if (isChallengeCompleted(me) && !ch.claimed) text += `\n\nUse: ${prefix}desafio coletar`;
+          text += `│\n│ 🎁 Prêmio: ${fmt(ch.reward)}\n`;
+          if (ch.claimed) text += `│ ✅ (coletado)\n`;
+          text += '│\n╰━━━━━━━━━━━━━━━━━━━━━━━━╯';
+          if (isChallengeCompleted(me) && !ch.claimed) text += `\n\n💡 Use: ${prefix}desafio coletar`;
           return reply(text);
         }
 
@@ -3702,8 +4079,14 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           if (!isFinite(amount) || amount <= 0) return reply('Valor inválido.');
           if (amount > me.wallet) return reply('Saldo insuficiente.');
           const win = Math.random() < 0.47;
-          if (win) { me.wallet += amount; saveEconomy(econ); return reply(`🍀 Você ganhou ${fmt(amount)}!`); }
-          me.wallet -= amount; saveEconomy(econ); return reply(`💥 Você perdeu ${fmt(amount)}.`);
+          if (win) { 
+            me.wallet += amount; 
+            saveEconomy(econ); 
+            return reply(`╭━━━⊱ 🍀 *VITÓRIA!* 🍀 ⊱━━━╮\n│\n│ 💰 Ganhou: *+${fmt(amount)}*\n│\n╰━━━━━━━━━━━━━━━━━━━━━╯`); 
+          }
+          me.wallet -= amount; 
+          saveEconomy(econ); 
+          return reply(`╭━━━⊱ 💥 *PERDEU!* 💥 ⊱━━━╮\n│\n│ 💸 Perdeu: *-${fmt(amount)}*\n│\n╰━━━━━━━━━━━━━━━━━━━━━╯`);
         }
         if (sub === 'slots') {
           const amount = parseAmount(args[0]||'100', me.wallet);
@@ -3717,20 +4100,76 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           const delta = Math.floor(amount * (mult-1));
           me.wallet += delta; // delta pode ser negativo
           saveEconomy(econ);
-          return reply(`🎰 ${r.join(' | ')}\n${mult>1?`Você ganhou ${fmt(Math.floor(amount*(mult-1)))}!`:`Você perdeu ${fmt(amount)}`}`);
+          
+          let slotText = `╭━━━⊱ 🎰 *SLOTS* 🎰 ⊱━━━╮\n`;
+          slotText += `│\n`;
+          slotText += `│ ${r.join(' | ')}\n`;
+          slotText += `│\n`;
+          slotText += `╰━━━━━━━━━━━━━━━━━━━━╯\n\n`;
+          
+          if (mult > 1) {
+            slotText += `╭━━━⊱ 🎉 *GANHOU!* 🎉 ⊱━━━╮\n`;
+            slotText += `│\n`;
+            slotText += `│ 💰 Ganhou: *+${fmt(Math.floor(amount*(mult-1)))}*\n`;
+            slotText += `│\n`;
+            slotText += `╰━━━━━━━━━━━━━━━━━━━━╯`;
+          } else {
+            slotText += `╭━━━⊱ 💸 *PERDEU!* 💸 ⊱━━━╮\n`;
+            slotText += `│\n`;
+            slotText += `│ 💔 Perdeu: *-${fmt(amount)}*\n`;
+            slotText += `│\n`;
+            slotText += `╰━━━━━━━━━━━━━━━━━━━━╯`;
+          }
+          
+          return reply(slotText);
         }
 
         if (sub === 'vagas') {
-          const jobs = econ.jobCatalog||{}; let txt='💼 Vagas de Emprego\n\n';
-          Object.entries(jobs).forEach(([k,j])=>{ txt += `• ${k} — ${j.name} (${fmt(j.min)}-${fmt(j.max)})\n`; });
-          txt += `\nUse: ${prefix}emprego <vaga>`; return reply(txt);
+          const jobs = econ.jobCatalog||{}; 
+          let txt='╭━━━⊱ 💼 *VAGAS DE EMPREGO* 💼 ⊱━━━╮\n│\n';
+          Object.entries(jobs).forEach(([k,j])=>{ 
+            txt += `│ 🔹 *${k}*\n│   ${j.name}\n│   💰 ${fmt(j.min)}-${fmt(j.max)}\n│\n`; 
+          });
+          txt += `╰━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n💡 Use: ${prefix}emprego <vaga>`; 
+          return reply(txt);
         }
         if (sub === 'emprego') {
-          const key = (args[0]||'').toLowerCase(); if (!key) return reply('Informe a vaga. Veja com '+prefix+'vagas');
-          const job = (econ.jobCatalog||{})[key]; if (!job) return reply('Vaga inexistente.');
-          me.job = key; saveEconomy(econ); return reply(`✅ Agora você trabalha como ${job.name}. Ganhos ao usar ${prefix}trabalhar aumentam conforme a vaga.`);
+          const key = (args[0]||'').toLowerCase(); 
+          if (!key) return reply(`╭━━━⊱ 💼 *EMPREGO* 💼 ⊱━━━╮
+│
+│ ❌ Informe a vaga desejada
+│
+│ 📋 Ver vagas: ${prefix}vagas
+│
+│ 💡 Exemplo:
+│ ${prefix}emprego vendedor
+│
+╰━━━━━━━━━━━━━━━━━━━━━╯`);
+          const job = (econ.jobCatalog||{})[key]; 
+          if (!job) return reply('❌ Vaga inexistente.');
+          me.job = key; 
+          saveEconomy(econ); 
+          return reply(`╭━━━⊱ ✅ *CONTRATADO!* ✅ ⊱━━━╮
+│
+│ 💼 Emprego: ${job.name}
+│ 💰 Ganhos: ${fmt(job.min)}-${fmt(job.max)}
+│
+│ 🏢 Use ${prefix}trabalhar
+│    para receber seu salário!
+│
+╰━━━━━━━━━━━━━━━━━━━━━━━╯`);
         }
-        if (sub === 'demitir') { me.job = null; saveEconomy(econ); return reply('👋 Você pediu demissão.'); }
+        if (sub === 'demitir') { 
+          me.job = null; 
+          saveEconomy(econ); 
+          return reply(`╭━━━⊱ 👋 *DEMISSÃO* 👋 ⊱━━━╮
+│
+│ ✅ Você pediu demissão
+│
+│ 💼 Veja novas vagas: ${prefix}vagas
+│
+╰━━━━━━━━━━━━━━━━━━━━━━╯`); 
+        }
 
         if (sub === 'pescar' || sub === 'fish') {
           const cd = me.cooldowns?.fish || 0; if (Date.now()<cd) return reply(`⏳ Aguarde ${timeLeft(cd)} para pescar novamente.`);
@@ -3739,17 +4178,43 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           const bonus = Math.floor(base * ((fishBonus||0) + skillB)); const total = base + bonus;
           me.wallet += total; me.cooldowns.fish = Date.now() + 4*60*1000; // cooldown maior
           addSkillXP(me,'fishing',1); updateChallenge(me,'fish',1,true); updatePeriodChallenge(me,'fish',1,true); saveEconomy(econ);
-          return reply(`🎣 Você pescou e ganhou ${fmt(total)} ${bonus>0?`(bônus ${fmt(bonus)})`:''}!`);
+          
+          let fishText = `╭━━━⊱ 🎣 *PESCOU!* 🎣 ⊱━━━╮\n`;
+          fishText += `│\n`;
+          fishText += `│ 💰 Ganhou: *${fmt(total)}*\n`;
+          if (bonus > 0) {
+            fishText += `│ ✨ Bônus: *+${fmt(bonus)}*\n`;
+          }
+          fishText += `│\n`;
+          fishText += `╰━━━━━━━━━━━━━━━━━━━━━╯`;
+          
+          return reply(fishText);
         }
 
         if (sub === 'explorar' || sub === 'explore') {
-          const cd = me.cooldowns?.explore || 0; if (Date.now()<cd) return reply(`⏳ Aguarde ${timeLeft(cd)} para explorar novamente.`);
+          const cd = me.cooldowns?.explore || 0; 
+          if (Date.now()<cd) return reply(`⏳ Aguarde ${timeLeft(cd)} para explorar novamente.`);
           const base = 35 + Math.floor(Math.random()*56); // 35-90
           const skillB = getSkillBonus(me,'exploring');
-          const bonus = Math.floor(base * ((exploreBonus||0) + skillB)); const total = base + bonus;
-          me.wallet += total; me.cooldowns.explore = Date.now() + 5*60*1000; // cooldown maior
-          addSkillXP(me,'exploring',1); updateChallenge(me,'explore',1,true); updatePeriodChallenge(me,'explore',1,true); saveEconomy(econ);
-          return reply(`🧭 Você explorou e encontrou ${fmt(total)} ${bonus>0?`(bônus ${fmt(bonus)})`:''}!`);
+          const bonus = Math.floor(base * ((exploreBonus||0) + skillB)); 
+          const total = base + bonus;
+          me.wallet += total; 
+          me.cooldowns.explore = Date.now() + 5*60*1000; // cooldown maior
+          addSkillXP(me,'exploring',1); 
+          updateChallenge(me,'explore',1,true); 
+          updatePeriodChallenge(me,'explore',1,true); 
+          saveEconomy(econ);
+          
+          let exploreText = `╭━━━⊱ 🧭 *EXPLOROU!* 🧭 ⊱━━━╮\n`;
+          exploreText += `│\n`;
+          exploreText += `│ 💰 Ganhou: *${fmt(total)}*\n`;
+          if (bonus > 0) {
+            exploreText += `│ ✨ Bônus: *+${fmt(bonus)}*\n`;
+          }
+          exploreText += `│\n`;
+          exploreText += `╰━━━━━━━━━━━━━━━━━━━━━╯`;
+          
+          return reply(exploreText);
         }
 
         if (sub === 'cacar' || sub === 'caçar' || sub === 'hunt') {
@@ -3759,7 +4224,17 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           const bonus = Math.floor(base * ((huntBonus||0) + skillB)); const total = base + bonus;
           me.wallet += total; me.cooldowns.hunt = Date.now() + 6*60*1000;
           addSkillXP(me,'hunting',1); updateChallenge(me,'hunt',1,true); updatePeriodChallenge(me,'hunt',1,true); saveEconomy(econ);
-          return reply(`🏹 Você caçou e ganhou ${fmt(total)} ${bonus>0?`(bônus ${fmt(bonus)})`:''}!`);
+          
+          let huntText = `╭━━━⊱ 🏹 *CAÇOU!* 🏹 ⊱━━━╮\n`;
+          huntText += `│\n`;
+          huntText += `│ 💰 Ganhou: *${fmt(total)}*\n`;
+          if (bonus > 0) {
+            huntText += `│ ✨ Bônus: *+${fmt(bonus)}*\n`;
+          }
+          huntText += `│\n`;
+          huntText += `╰━━━━━━━━━━━━━━━━━━━━━╯`;
+          
+          return reply(huntText);
         }
 
         if (sub === 'forjar' || sub === 'forge') {
@@ -3806,18 +4281,418 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         }
 
     if (sub === 'crime') {
-          const cd = me.cooldowns?.crime || 0; if (Date.now()<cd) return reply(`⏳ Aguarde ${timeLeft(cd)} para tentar de novo.`);
+          const cd = me.cooldowns?.crime || 0; 
+          if (Date.now()<cd) return reply(`⏳ Aguarde ${timeLeft(cd)} para tentar de novo.`);
           const success = Math.random() < 0.35; // 35% sucesso, mais difícil
           if (success) {
             const base = 90 + Math.floor(Math.random()*141); // 90-230, menor
             const skillB = getSkillBonus(me,'crime');
             const gain = Math.floor(base * (1 + skillB));
-            me.wallet += gain; me.cooldowns.crime = Date.now()+10*60*1000; addSkillXP(me,'crime',1); updateChallenge(me,'crimeSuccess',1,true); updatePeriodChallenge(me,'crimeSuccess',1,true); saveEconomy(econ);
-            return reply(`🕵️ Você cometeu um crime e lucrou ${fmt(gain)}. Cuidado para não ser pego!`);
+            me.wallet += gain; 
+            me.cooldowns.crime = Date.now()+10*60*1000; 
+            addSkillXP(me,'crime',1); 
+            updateChallenge(me,'crimeSuccess',1,true); 
+            updatePeriodChallenge(me,'crimeSuccess',1,true); 
+            saveEconomy(econ);
+            return reply(`╭━━━⊱ 🕵️ *CRIME* 🕵️ ⊱━━━╮
+│
+│ ✅ Crime bem-sucedido!
+│ 💰 Lucrou: ${fmt(gain)}
+│
+│ ⚠️ Cuidado para não ser pego!
+│
+╰━━━━━━━━━━━━━━━━━━━━━╯`);
           } else {
-            const fine = 120 + Math.floor(Math.random()*201); const pay = Math.min(me.wallet, fine); me.wallet -= pay; me.cooldowns.crime = Date.now()+10*60*1000; saveEconomy(econ);
-            return reply(`🚔 Você foi pego! Pagou multa de ${fmt(pay)}.`);
+            const fine = 120 + Math.floor(Math.random()*201); 
+            const pay = Math.min(me.wallet, fine); 
+            me.wallet -= pay; 
+            me.cooldowns.crime = Date.now()+10*60*1000; 
+            saveEconomy(econ);
+            return reply(`╭━━━⊱ 🚔 *PEGO!* 🚔 ⊱━━━╮
+│
+│ ❌ Você foi pego pela polícia!
+│ 💸 Multa: ${fmt(pay)}
+│
+╰━━━━━━━━━━━━━━━━━━━━╯`);
           }
+        }
+
+        // ===== SISTEMA DE COZINHAR =====
+        if (sub === 'receitas') {
+          // Inicializa receitas culinárias se não existir
+          if (!econ.cookingRecipes) {
+            econ.cookingRecipes = {
+              pao: { name: '🍞 Pão', requires: { trigo: 3 }, gold: 10, sellPrice: 50, energy: 10 },
+              sopa: { name: '🍲 Sopa', requires: { cenoura: 2, batata: 2 }, gold: 15, sellPrice: 80, energy: 20 },
+              salada: { name: '🥗 Salada', requires: { alface: 2, tomate: 2 }, gold: 12, sellPrice: 60, energy: 15 },
+              bolo: { name: '🍰 Bolo', requires: { trigo: 5, ovo: 3 }, gold: 25, sellPrice: 120, energy: 30 },
+              pizza: { name: '🍕 Pizza', requires: { trigo: 4, tomate: 3, queijo: 2 }, gold: 35, sellPrice: 150, energy: 40 },
+              hamburguer: { name: '🍔 Hambúrguer', requires: { carne: 2, trigo: 3, alface: 1 }, gold: 40, sellPrice: 180, energy: 50 },
+              sushi: { name: '🍣 Sushi', requires: { peixe: 4, arroz: 3 }, gold: 50, sellPrice: 200, energy: 45 },
+              macarrao: { name: '🍝 Macarrão', requires: { trigo: 3, tomate: 2 }, gold: 20, sellPrice: 90, energy: 25 }
+            };
+            saveEconomy(econ);
+          }
+
+          let text = '📖 *RECEITAS CULINÁRIAS*\n\n';
+          for (const [key, rec] of Object.entries(econ.cookingRecipes)) {
+            const ingredients = Object.entries(rec.requires).map(([ing, qty]) => `${ing} x${qty}`).join(', ');
+            text += `${rec.name}\n`;
+            text += `  📦 Ingredientes: ${ingredients}\n`;
+            text += `  💰 Custo: ${fmt(rec.gold)}\n`;
+            text += `  💵 Venda: ${fmt(rec.sellPrice)}\n`;
+            text += `  ⚡ Energia: +${rec.energy}\n`;
+            text += `  🍳 Cozinhar: ${prefix}cozinhar ${key}\n\n`;
+          }
+          text += `💡 *Dica:* Plante ingredientes com ${prefix}plantar`;
+          return reply(text);
+        }
+
+        if (sub === 'cozinhar' || sub === 'cook') {
+          const recipeKey = (args[0] || '').toLowerCase();
+          
+          // Inicializa receitas se não existir
+          if (!econ.cookingRecipes) {
+            econ.cookingRecipes = {
+              pao: { name: '🍞 Pão', requires: { trigo: 3 }, gold: 10, sellPrice: 50, energy: 10 },
+              sopa: { name: '🍲 Sopa', requires: { cenoura: 2, batata: 2 }, gold: 15, sellPrice: 80, energy: 20 },
+              salada: { name: '🥗 Salada', requires: { alface: 2, tomate: 2 }, gold: 12, sellPrice: 60, energy: 15 },
+              bolo: { name: '🍰 Bolo', requires: { trigo: 5, ovo: 3 }, gold: 25, sellPrice: 120, energy: 30 },
+              pizza: { name: '🍕 Pizza', requires: { trigo: 4, tomate: 3, queijo: 2 }, gold: 35, sellPrice: 150, energy: 40 },
+              hamburguer: { name: '🍔 Hambúrguer', requires: { carne: 2, trigo: 3, alface: 1 }, gold: 40, sellPrice: 180, energy: 50 },
+              sushi: { name: '🍣 Sushi', requires: { peixe: 4, arroz: 3 }, gold: 50, sellPrice: 200, energy: 45 },
+              macarrao: { name: '🍝 Macarrão', requires: { trigo: 3, tomate: 2 }, gold: 20, sellPrice: 90, energy: 25 }
+            };
+          }
+
+          if (!recipeKey) {
+            return reply(`👨‍🍳 *SISTEMA DE COZINHA*\n\n📖 Veja as receitas disponíveis: ${prefix}receitas\n🍳 Cozinhar: ${prefix}cozinhar <receita>\n\n💡 Exemplo: ${prefix}cozinhar pao`);
+          }
+
+          const recipe = econ.cookingRecipes[recipeKey];
+          if (!recipe) {
+            return reply(`❌ Receita não encontrada! Use ${prefix}receitas para ver todas as receitas disponíveis.`);
+          }
+
+          // Verifica cooldown
+          const cd = me.cooldowns?.cook || 0;
+          if (Date.now() < cd) {
+            return reply(`⏳ Você ainda está cozinhando! Aguarde ${timeLeft(cd)}.`);
+          }
+
+          // Verifica gold
+          if (me.wallet < recipe.gold) {
+            return reply(`💰 Você precisa de ${fmt(recipe.gold)} para cozinhar ${recipe.name}. Saldo atual: ${fmt(me.wallet)}`);
+          }
+
+          // Verifica ingredientes
+          me.ingredients = me.ingredients || {};
+          for (const [ing, qty] of Object.entries(recipe.requires)) {
+            if ((me.ingredients[ing] || 0) < qty) {
+              return reply(`📦 Ingredientes insuficientes! Você precisa de ${ing} x${qty}, mas tem apenas x${me.ingredients[ing] || 0}.\n\n🌱 Plante ingredientes com ${prefix}plantar`);
+            }
+          }
+
+          // Consome recursos
+          me.wallet -= recipe.gold;
+          for (const [ing, qty] of Object.entries(recipe.requires)) {
+            me.ingredients[ing] -= qty;
+          }
+
+          // Adiciona comida ao inventário
+          me.cookedFood = me.cookedFood || {};
+          me.cookedFood[recipeKey] = (me.cookedFood[recipeKey] || 0) + 1;
+
+          // Skill e desafios
+          addSkillXP(me, 'cooking', 2);
+          updateChallenge(me, 'cook', 1, true);
+          updatePeriodChallenge(me, 'cook', 1, true);
+
+          // Cooldown de 3 minutos
+          me.cooldowns.cook = Date.now() + 3 * 60 * 1000;
+          
+          saveEconomy(econ);
+
+          return reply(`👨‍🍳 *COZINHA CONCLUÍDA!*\n\n${recipe.name} preparado com sucesso!\n⚡ Energia: +${recipe.energy}\n💵 Valor de venda: ${fmt(recipe.sellPrice)}\n\n🍴 Use ${prefix}comer ${recipeKey} para consumir\n💰 Use ${prefix}vendercomida ${recipeKey} para vender`);
+        }
+
+        // ===== SISTEMA DE PLANTAÇÃO =====
+        if (sub === 'plantacao' || sub === 'plantação' || sub === 'horta') {
+          me.farm = me.farm || { plots: [], maxPlots: 4, lastExpansion: 0 };
+          
+          const now = Date.now();
+          let text = '🌾 *MINHA PLANTAÇÃO*\n\n';
+          text += `📊 Terrenos: ${me.farm.plots.length}/${me.farm.maxPlots}\n\n`;
+
+          if (me.farm.plots.length === 0) {
+            text += '🌱 Sua plantação está vazia!\n\n';
+          } else {
+            me.farm.plots.forEach((plot, idx) => {
+              const timeLeft = plot.readyAt - now;
+              const isReady = timeLeft <= 0;
+              const seed = econ.seeds?.[plot.seed] || { name: plot.seed, growTime: 600000, yield: { [plot.seed]: 1 } };
+              
+              text += `🌱 *Terreno ${idx + 1}*\n`;
+              text += `  Semente: ${seed.name}\n`;
+              if (isReady) {
+                text += `  ✅ Pronto para colher!\n`;
+              } else {
+                const mins = Math.ceil(timeLeft / 60000);
+                text += `  ⏳ Pronto em: ${mins} min\n`;
+              }
+              text += `\n`;
+            });
+          }
+
+          text += `\n💡 *Comandos:*\n`;
+          text += `🌱 Plantar: ${prefix}plantar <semente>\n`;
+          text += `🌾 Colher: ${prefix}colher\n`;
+          text += `📦 Sementes: ${prefix}sementes\n`;
+
+          return reply(text);
+        }
+
+        if (sub === 'plantar' || sub === 'plant' || sub === 'farm') {
+          const seedKey = (args[0] || '').toLowerCase();
+          
+          // Inicializa sistema de sementes
+          if (!econ.seeds) {
+            econ.seeds = {
+              trigo: { name: '🌾 Trigo', cost: 20, growTime: 5 * 60 * 1000, yield: { trigo: 3 } },
+              cenoura: { name: '🥕 Cenoura', cost: 15, growTime: 4 * 60 * 1000, yield: { cenoura: 2 } },
+              batata: { name: '🥔 Batata', cost: 15, growTime: 4 * 60 * 1000, yield: { batata: 2 } },
+              tomate: { name: '🍅 Tomate', cost: 18, growTime: 6 * 60 * 1000, yield: { tomate: 3 } },
+              alface: { name: '🥬 Alface', cost: 12, growTime: 3 * 60 * 1000, yield: { alface: 2 } },
+              milho: { name: '🌽 Milho', cost: 25, growTime: 7 * 60 * 1000, yield: { milho: 4 } },
+              arroz: { name: '🌾 Arroz', cost: 22, growTime: 8 * 60 * 1000, yield: { arroz: 4 } },
+              cana: { name: '🌿 Cana-de-açúcar', cost: 30, growTime: 10 * 60 * 1000, yield: { acucar: 5 } }
+            };
+            saveEconomy(econ);
+          }
+
+          if (!seedKey) {
+            let text = '🌱 *SISTEMA DE PLANTAÇÃO*\n\n';
+            text += '📦 *Sementes Disponíveis:*\n\n';
+            for (const [key, seed] of Object.entries(econ.seeds)) {
+              const mins = Math.floor(seed.growTime / 60000);
+              const yieldText = Object.entries(seed.yield).map(([k, v]) => `${k} x${v}`).join(', ');
+              text += `${seed.name}\n`;
+              text += `  💰 Custo: ${fmt(seed.cost)}\n`;
+              text += `  ⏱️ Tempo: ${mins} min\n`;
+              text += `  🌾 Colheita: ${yieldText}\n\n`;
+            }
+            text += `🌱 Plantar: ${prefix}plantar <semente>\n`;
+            text += `💡 Exemplo: ${prefix}plantar trigo`;
+            return reply(text);
+          }
+
+          const seed = econ.seeds[seedKey];
+          if (!seed) {
+            return reply(`❌ Semente não encontrada! Use ${prefix}plantar para ver as sementes disponíveis.`);
+          }
+
+          // Inicializa fazenda do usuário
+          me.farm = me.farm || { plots: [], maxPlots: 4, lastExpansion: 0 };
+
+          // Verifica se tem espaço
+          if (me.farm.plots.length >= me.farm.maxPlots) {
+            return reply(`🌾 Todos os seus terrenos estão ocupados! Aguarde a colheita ou expanda sua fazenda.\n\n🌾 Use ${prefix}colher para colher plantas prontas`);
+          }
+
+          // Verifica gold
+          if (me.wallet < seed.cost) {
+            return reply(`💰 Você precisa de ${fmt(seed.cost)} para plantar ${seed.name}. Saldo: ${fmt(me.wallet)}`);
+          }
+
+          // Planta
+          me.wallet -= seed.cost;
+          const now = Date.now();
+          me.farm.plots.push({
+            seed: seedKey,
+            plantedAt: now,
+            readyAt: now + seed.growTime
+          });
+
+          // Skill
+          addSkillXP(me, 'farming', 1);
+          updateChallenge(me, 'plant', 1, true);
+          updatePeriodChallenge(me, 'plant', 1, true);
+
+          saveEconomy(econ);
+
+          const mins = Math.floor(seed.growTime / 60000);
+          return reply(`🌱 ${seed.name} plantado com sucesso!\n\n⏱️ Estará pronto para colher em ${mins} minutos.\n🌾 Terrenos ocupados: ${me.farm.plots.length}/${me.farm.maxPlots}\n\n💡 Use ${prefix}horta para ver suas plantações`);
+        }
+
+        if (sub === 'colher' || sub === 'harvest') {
+          me.farm = me.farm || { plots: [], maxPlots: 4, lastExpansion: 0 };
+
+          if (me.farm.plots.length === 0) {
+            return reply(`🌾 Você não tem nada plantado!\n\n🌱 Use ${prefix}plantar <semente> para começar a cultivar.`);
+          }
+
+          const now = Date.now();
+          const readyPlots = me.farm.plots.filter(plot => plot.readyAt <= now);
+
+          if (readyPlots.length === 0) {
+            const nextReady = Math.min(...me.farm.plots.map(p => p.readyAt));
+            const timeLeft = Math.ceil((nextReady - now) / 60000);
+            return reply(`⏳ Nenhuma planta está pronta para colher ainda.\n\n🕐 Próxima colheita em: ${timeLeft} minuto(s)\n\n💡 Use ${prefix}horta para ver o status de todas as plantações`);
+          }
+
+          // Colhe todas as plantas prontas
+          me.ingredients = me.ingredients || {};
+          let harvestedText = '';
+          let totalValue = 0;
+
+          readyPlots.forEach(plot => {
+            const seed = econ.seeds?.[plot.seed];
+            if (seed && seed.yield) {
+              for (const [ingredient, qty] of Object.entries(seed.yield)) {
+                me.ingredients[ingredient] = (me.ingredients[ingredient] || 0) + qty;
+                harvestedText += `${ingredient} x${qty}, `;
+                totalValue += qty * 10; // Valor estimado
+              }
+            }
+          });
+
+          // Remove plantas colhidas
+          me.farm.plots = me.farm.plots.filter(plot => plot.readyAt > now);
+
+          // Skill e desafios
+          addSkillXP(me, 'farming', readyPlots.length * 2);
+          updateChallenge(me, 'harvest', readyPlots.length, true);
+          updatePeriodChallenge(me, 'harvest', readyPlots.length, true);
+
+          saveEconomy(econ);
+
+          harvestedText = harvestedText.slice(0, -2); // Remove última vírgula
+
+          return reply(`🌾 *COLHEITA CONCLUÍDA!*\n\n✅ Plantas colhidas: ${readyPlots.length}\n📦 Ingredientes obtidos:\n${harvestedText}\n\n💵 Valor estimado: ${fmt(totalValue)}\n🌱 Terrenos livres: ${me.farm.maxPlots - me.farm.plots.length}/${me.farm.maxPlots}\n\n👨‍🍳 Use ${prefix}receitas para ver o que pode cozinhar!`);
+        }
+
+        // ===== COMANDOS COMPLEMENTARES DE COZINHA =====
+        if (sub === 'ingredientes') {
+          me.ingredients = me.ingredients || {};
+          const entries = Object.entries(me.ingredients).filter(([, qty]) => qty > 0);
+          
+          if (entries.length === 0) {
+            return reply(`📦 *INGREDIENTES*\n\nVocê não possui ingredientes.\n\n🌱 Plante com ${prefix}plantar para conseguir ingredientes!`);
+          }
+
+          let text = '📦 *MEUS INGREDIENTES*\n\n';
+          for (const [ing, qty] of entries) {
+            text += `• ${ing}: x${qty}\n`;
+          }
+          text += `\n👨‍🍳 Use ${prefix}receitas para ver o que pode cozinhar`;
+          return reply(text);
+        }
+
+        if (sub === 'comer' || sub === 'eat') {
+          const foodKey = (args[0] || '').toLowerCase();
+          
+          me.cookedFood = me.cookedFood || {};
+          
+          if (!foodKey) {
+            const entries = Object.entries(me.cookedFood).filter(([, qty]) => qty > 0);
+            if (entries.length === 0) {
+              return reply(`🍽️ Você não tem comida preparada.\n\n👨‍🍳 Cozinhe algo com ${prefix}cozinhar`);
+            }
+            
+            let text = '🍽️ *COMIDAS PREPARADAS*\n\n';
+            for (const [key, qty] of entries) {
+              const recipe = econ.cookingRecipes?.[key];
+              if (recipe) {
+                text += `${recipe.name} x${qty}\n`;
+                text += `  ⚡ Energia: +${recipe.energy}\n`;
+                text += `  💵 Valor: ${fmt(recipe.sellPrice)}\n\n`;
+              }
+            }
+            text += `🍴 Comer: ${prefix}comer <comida>\n`;
+            text += `💰 Vender: ${prefix}vendercomida <comida>`;
+            return reply(text);
+          }
+
+          if (!me.cookedFood[foodKey] || me.cookedFood[foodKey] <= 0) {
+            return reply(`❌ Você não tem ${foodKey} preparado.\n\n👨‍🍳 Cozinhe com ${prefix}cozinhar ${foodKey}`);
+          }
+
+          const recipe = econ.cookingRecipes?.[foodKey];
+          if (!recipe) {
+            return reply('❌ Receita não encontrada.');
+          }
+
+          // Consome a comida
+          me.cookedFood[foodKey] -= 1;
+          
+          // Adiciona energia (pode ser usado para reduzir cooldowns ou dar bônus)
+          me.energy = (me.energy || 0) + recipe.energy;
+          
+          // Skill
+          addSkillXP(me, 'cooking', 1);
+          
+          saveEconomy(econ);
+
+          return reply(`😋 *DELICIOSO!*\n\nVocê comeu ${recipe.name}!\n⚡ Energia: +${recipe.energy}\n💪 Energia total: ${me.energy}\n\n💡 Quanto mais energia, mais bônus você recebe!`);
+        }
+
+        if (sub === 'vendercomida') {
+          const foodKey = (args[0] || '').toLowerCase();
+          
+          me.cookedFood = me.cookedFood || {};
+          
+          if (!foodKey) {
+            return reply(`💰 *VENDER COMIDA*\n\nUse: ${prefix}vendercomida <comida>\n\n💡 Veja suas comidas com ${prefix}comer`);
+          }
+
+          const qty = parseInt(args[1]) || 1;
+          
+          if (!me.cookedFood[foodKey] || me.cookedFood[foodKey] < qty) {
+            return reply(`❌ Você não tem ${qty}x ${foodKey}.\n\n🍽️ Você tem: ${me.cookedFood[foodKey] || 0}`);
+          }
+
+          const recipe = econ.cookingRecipes?.[foodKey];
+          if (!recipe) {
+            return reply('❌ Receita não encontrada.');
+          }
+
+          const totalValue = recipe.sellPrice * qty;
+          me.cookedFood[foodKey] -= qty;
+          me.wallet += totalValue;
+          
+          saveEconomy(econ);
+
+          return reply(`💰 *VENDA CONCLUÍDA!*\n\nVocê vendeu ${qty}x ${recipe.name}\n💵 Ganhou: ${fmt(totalValue)}\n💼 Carteira: ${fmt(me.wallet)}`);
+        }
+
+        if (sub === 'sementes') {
+          // Inicializa sementes se não existir
+          if (!econ.seeds) {
+            econ.seeds = {
+              trigo: { name: '🌾 Trigo', cost: 20, growTime: 5 * 60 * 1000, yield: { trigo: 3 } },
+              cenoura: { name: '🥕 Cenoura', cost: 15, growTime: 4 * 60 * 1000, yield: { cenoura: 2 } },
+              batata: { name: '🥔 Batata', cost: 15, growTime: 4 * 60 * 1000, yield: { batata: 2 } },
+              tomate: { name: '🍅 Tomate', cost: 18, growTime: 6 * 60 * 1000, yield: { tomate: 3 } },
+              alface: { name: '🥬 Alface', cost: 12, growTime: 3 * 60 * 1000, yield: { alface: 2 } },
+              milho: { name: '🌽 Milho', cost: 25, growTime: 7 * 60 * 1000, yield: { milho: 4 } },
+              arroz: { name: '🌾 Arroz', cost: 22, growTime: 8 * 60 * 1000, yield: { arroz: 4 } },
+              cana: { name: '🌿 Cana-de-açúcar', cost: 30, growTime: 10 * 60 * 1000, yield: { acucar: 5 } }
+            };
+            saveEconomy(econ);
+          }
+
+          let text = '🌱 *CATÁLOGO DE SEMENTES*\n\n';
+          for (const [key, seed] of Object.entries(econ.seeds)) {
+            const mins = Math.floor(seed.growTime / 60000);
+            const yieldText = Object.entries(seed.yield).map(([k, v]) => `${k} x${v}`).join(', ');
+            text += `${seed.name}\n`;
+            text += `  💰 Custo: ${fmt(seed.cost)}\n`;
+            text += `  ⏱️ Crescimento: ${mins} min\n`;
+            text += `  🌾 Colheita: ${yieldText}\n`;
+            text += `  🌱 Plantar: ${prefix}plantar ${key}\n\n`;
+          }
+          text += `💡 *Dica:* Use ${prefix}horta para ver suas plantações`;
+          return reply(text);
         }
 
         if (sub === 'minerar' || sub === 'mine') {
@@ -4121,6 +4996,12 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         
         if (!me.pets) me.pets = [];
         
+        // Aplica degradação automática
+        const degradation = applyPetDegradation(me.pets);
+        if (degradation.changed) {
+          saveEconomy(econ);
+        }
+        
         if (me.pets.length === 0) {
           let text = `╭━━━⊱ 🐾 *SISTEMA DE PETS* ⊱━━━╮\n`;
           text += `│ Você ainda não tem companheiros!\n`;
@@ -4140,11 +5021,26 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         text += `│ Total de Pets: ${me.pets.length}/5\n`;
         text += `╰━━━━━━━━━━━━━━━━━━━━╯\n\n`;
         
+        let hasWarnings = false;
         me.pets.forEach((pet, i) => {
           const hungerBar = '█'.repeat(Math.floor(pet.hunger / 10)) + '░'.repeat(10 - Math.floor(pet.hunger / 10));
           const moodBar = '█'.repeat(Math.floor(pet.mood / 10)) + '░'.repeat(10 - Math.floor(pet.mood / 10));
           
-          text += `${i + 1}. ${pet.emoji} *${pet.name}*\n`;
+          // Status de alerta
+          let statusEmoji = '';
+          if (pet.hunger < 20) {
+            statusEmoji = ' ⚠️ FOME CRÍTICA';
+            hasWarnings = true;
+          } else if (pet.hunger < 40) {
+            statusEmoji = ' 🍖 Com fome';
+          }
+          
+          if (pet.mood < 20) {
+            statusEmoji += ' 😢 TRISTE';
+            hasWarnings = true;
+          }
+          
+          text += `${i + 1}. ${pet.emoji} *${pet.name}*${statusEmoji}\n`;
           text += `┌─────────────────\n`;
           text += `│ 📊 Level ${pet.level} | 💫 ${pet.exp}/${pet.level * 100} EXP\n`;
           text += `│ ❤️ HP: ${pet.hp}/${pet.maxHp}\n`;
@@ -4154,12 +5050,17 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           text += `└─────────────────\n\n`;
         });
         
+        if (hasWarnings) {
+          text += `⚠️ *ATENÇÃO:* Alguns pets precisam de cuidados!\n\n`;
+        }
+        
         text += `🎮 *COMANDOS DISPONÍVEIS:*\n`;
         text += `• ${prefix}alimentar <número>\n`;
         text += `• ${prefix}treinar <número>\n`;
         text += `• ${prefix}evoluir <número>\n`;
         text += `• ${prefix}renomear <número> <nome>\n`;
-        text += `• ${prefix}batalha <número> @user`;
+        text += `• ${prefix}batalha <número> @user\n\n`;
+        text += `💡 Seus pets perdem fome e humor com o tempo!`;
         
         return reply(text);
         break;
@@ -4219,7 +5120,8 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           hunger: 100,
           mood: 100,
           wins: 0,
-          losses: 0
+          losses: 0,
+          lastUpdate: Date.now() // Timestamp para degradação
         });
         
         saveEconomy(econ);
@@ -4231,7 +5133,8 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         text += `│ ${pet.desc}\n`;
         text += `│\n`;
         text += `╰━━━━━━━━━━━━━━━━━━━━╯\n\n`;
-        text += `💡 Use ${prefix}pets para ver seus companheiros`;
+        text += `💡 Use ${prefix}pets para ver seus companheiros\n`;
+        text += `⚠️ Lembre-se: seus pets precisam de cuidados regulares!`;
         
         return reply(text);
         break;
@@ -4246,6 +5149,9 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         const me = getEcoUser(econ, sender);
         
         if (!me.pets || me.pets.length === 0) return reply('🐾 Você não tem pets para alimentar!');
+        
+        // Aplica degradação antes de alimentar
+        applyPetDegradation(me.pets);
         
         const index = parseInt(q) - 1;
         if (isNaN(index) || index < 0 || index >= me.pets.length) {
@@ -4262,15 +5168,25 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         const hungerGain = 30 + Math.floor(Math.random() * 20);
         pet.hunger = Math.min(100, pet.hunger + hungerGain);
         pet.mood = Math.min(100, pet.mood + 10);
+        pet.lastUpdate = Date.now(); // Atualiza timestamp
+        
+        // Recupera HP se estava perdendo
+        if (pet.hp < pet.maxHp) {
+          const hpRecover = Math.floor(pet.maxHp * 0.1);
+          pet.hp = Math.min(pet.maxHp, pet.hp + hpRecover);
+        }
         
         saveEconomy(econ);
         
         let text = `╭━━━⊱ 🍖 *ALIMENTAÇÃO* ⊱━━━╮\n`;
         text += `│ ${pet.emoji} *${pet.name}* comeu!\n`;
         text += `╰━━━━━━━━━━━━━━━━━━━━╯\n\n`;
-        text += `😊 Humor: ${pet.mood}/100\n`;
-        text += `🍖 Fome: ${pet.hunger}/100 (+${hungerGain})\n\n`;
-        text += `💸 Custo: -${foodCost} moedas`;
+        text += `😊 Humor: ${pet.mood}/100 (+10)\n`;
+        text += `🍖 Fome: ${pet.hunger}/100 (+${hungerGain})\n`;
+        if (pet.hp < pet.maxHp) {
+          text += `❤️ HP: ${pet.hp}/${pet.maxHp} (recuperando)\n`;
+        }
+        text += `\n💸 Custo: -${foodCost} moedas`;
         
         return reply(text);
         break;
@@ -4285,6 +5201,9 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         const me = getEcoUser(econ, sender);
         
         if (!me.pets || me.pets.length === 0) return reply('🐾 Você não tem pets para treinar!');
+        
+        // Aplica degradação antes de treinar
+        applyPetDegradation(me.pets);
         
         const index = parseInt(q) - 1;
         if (isNaN(index) || index < 0 || index >= me.pets.length) {
@@ -4305,6 +5224,9 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         pet.hunger = Math.max(0, pet.hunger - 20);
         pet.lastTrain = now;
         
+        // Atualiza missão de treinar pet
+        updateQuestProgress(me, 'train_pet', 1);
+        
         let text = `╭━━━⊱ 💪 *TREINAMENTO* ⊱━━━╮\n`;
         text += `│ ${pet.emoji} *${pet.name}* treinou!\n`;
         text += `╰━━━━━━━━━━━━━━━━━━━━╯\n\n`;
@@ -4321,11 +5243,18 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           pet.hp = pet.maxHp;
           pet.exp = 0;
           
-          text += `🎉 *LEVEL UP!* 🎉\n\n`;
-          text += `📊 Nível: ${pet.level - 1} → *${pet.level}*\n`;
-          text += `⚔️ ATK: ${pet.attack - atkGain} → *${pet.attack}* (+${atkGain})\n`;
-          text += `🛡️ DEF: ${pet.defense - defGain} → *${pet.defense}* (+${defGain})\n`;
-          text += `❤️ HP: ${pet.maxHp - hpGain} → *${pet.maxHp}* (+${hpGain})`;
+          text += `╭━━━⊱ � *PET EVOLUIU!* � ⊱━━━╮\n`;
+          text += `│\n`;
+          text += `│ 🐾 *${pet.name}* ${pet.emoji}\n`;
+          text += `│\n`;
+          text += `│ 📊 *Nível:* ${pet.level - 1} ➜ *${pet.level}*\n`;
+          text += `│\n`;
+          text += `│ ⚔️ *ATK:* ${pet.attack - atkGain} ➜ *${pet.attack}* *(+${atkGain})*\n`;
+          text += `│ 🛡️ *DEF:* ${pet.defense - defGain} ➜ *${pet.defense}* *(+${defGain})*\n`;
+          text += `│ ❤️ *HP:* ${pet.maxHp - hpGain} ➜ *${pet.maxHp}* *(+${hpGain})*\n`;
+          text += `│\n`;
+          text += `╰━━━━━━━━━━━━━━━━━━━━━━━╯\n`;
+          text += `\n✨ *Seu pet ficou mais forte!* ✨`;
           
           saveEconomy(econ);
           return reply(text);
@@ -4392,8 +5321,8 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         break;
       }
 
-      case 'renomear':
-      case 'rename': {
+      case 'renomearpet':
+      case 'renamepet': {
         if (!isGroup) return reply('⚔️ Este comando funciona apenas em grupos com Modo RPG ativo.');
         if (!groupData.modorpg) return reply(`⚔️ Modo RPG desativado! Use ${prefix}modorpg para ativar.`);
         
@@ -4581,13 +5510,50 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           me.wallet += reward;
           me.exp = (me.exp || 0) + dungeon.exp;
           
-          let text = `╭━━━⊱ ⚔️ *VITÓRIA!* ⊱━━━╮\n`;
-          text += `│ ${dungeon.emoji} ${dungeon.name}\n`;
-          text += `╰━━━━━━━━━━━━━━━━━━━━╯\n\n`;
-          text += `🎉 Você derrotou todos os monstros!\n\n`;
-          text += `💰 Moedas: +${reward.toLocaleString()}\n`;
-          text += `✨ EXP: +${dungeon.exp}\n\n`;
-          text += `🏆 Continue assim, aventureiro!`;
+          // Verifica level up
+          if (!me.level) me.level = 1;
+          const nextLevelXp = 100 * Math.pow(1.5, me.level - 1);
+          let leveledUp = false;
+          let levelsGained = 0;
+          
+          while (me.exp >= nextLevelXp) {
+            me.exp -= nextLevelXp;
+            me.level++;
+            levelsGained++;
+            leveledUp = true;
+            if (me.level > 100) break; // Safety cap
+          }
+          
+          // Atualiza missão de dungeon
+          updateQuestProgress(me, 'dungeon', 1);
+          
+          let text = `╭━━━⊱ ⚔️ *VITÓRIA!* ⚔️ ⊱━━━╮\n`;
+          text += `│\n`;
+          text += `│ ${dungeon.emoji} *${dungeon.name}*\n`;
+          text += `│\n`;
+          text += `╰━━━━━━━━━━━━━━━━━━━━━╯\n\n`;
+          text += `🎉 *Você derrotou todos os monstros!*\n\n`;
+          text += `┌─⊱ 💰 *RECOMPENSAS* ⊰─┐\n`;
+          text += `│\n`;
+          text += `│ 💵 Moedas: *+${reward.toLocaleString()}*\n`;
+          text += `│ ✨ EXP: *+${dungeon.exp}*\n`;
+          
+          if (leveledUp) {
+            text += `│\n`;
+            text += `╰━━━━━━━━━━━━━━━━━━━━╯\n\n`;
+            text += `╭━━━⊱ � *LEVEL UP!* � ⊱━━━╮\n`;
+            text += `│\n`;
+            text += `│ 📊 Você subiu *${levelsGained}*`;
+            text += levelsGained > 1 ? ` *níveis!*\n` : ` *nível!*\n`;
+            text += `│ � Nível atual: *${me.level}*\n`;
+            text += `│\n`;
+            text += `╰━━━━━━━━━━━━━━━━━━━━━╯`;
+          } else {
+            text += `│\n`;
+            text += `└━━━━━━━━━━━━━━━━━━━━┘`;
+          }
+          
+          text += `\n\n🏆 *Continue assim, aventureiro!*`;
           
           saveEconomy(econ);
           return reply(text);
@@ -4595,12 +5561,18 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           const loss = Math.floor(me.wallet * 0.1);
           me.wallet = Math.max(0, me.wallet - loss);
           
-          let text = `╭━━━⊱ 💀 *DERROTA!* ⊱━━━╮\n`;
-          text += `│ ${dungeon.emoji} ${dungeon.name}\n`;
-          text += `╰━━━━━━━━━━━━━━━━━━━━╯\n\n`;
-          text += `😵 Você foi derrotado pelos monstros...\n\n`;
-          text += `💸 Perdeu: -${loss.toLocaleString()}\n\n`;
-          text += `💪 Fortaleça-se e tente novamente!`;
+          let text = `╭━━━⊱ 💀 *DERROTA!* 💀 ⊱━━━╮\n`;
+          text += `│\n`;
+          text += `│ ${dungeon.emoji} *${dungeon.name}*\n`;
+          text += `│\n`;
+          text += `╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n`;
+          text += `😵 *Você foi derrotado pelos monstros...*\n\n`;
+          text += `┌─⊱ 💸 *PERDAS* ⊰─┐\n`;
+          text += `│\n`;
+          text += `│ 💵 Moedas: *-${loss.toLocaleString()}*\n`;
+          text += `│\n`;
+          text += `└━━━━━━━━━━━━━━━━━━━━┘\n\n`;
+          text += `💪 *Fortaleça-se e tente novamente!*`;
           
           saveEconomy(econ);
           return reply(text);
@@ -4670,11 +5642,40 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           opponent.wallet = Math.max(0, opponent.wallet - reward);
           me.exp = (me.exp || 0) + 150;
           
+          // Verifica level up
+          if (!me.level) me.level = 1;
+          const nextLevelXp = 100 * Math.pow(1.5, me.level - 1);
+          let leveledUp = false;
+          
+          if (me.exp >= nextLevelXp) {
+            me.exp -= nextLevelXp;
+            me.level++;
+            leveledUp = true;
+          }
+          
+          // Atualiza missão de duelo
+          updateQuestProgress(me, 'duel', 1);
+          
           text += battle;
-          text += `\n🏆 *VITÓRIA!*\n\n`;
-          text += `💰 Recompensa: +${reward.toLocaleString()}\n`;
-          text += `✨ EXP: +150\n`;
-          text += `❤️ HP restante: ${Math.max(0, myHp)}`;
+          text += `\n╭━━━⊱ 🏆 *VITÓRIA!* 🏆 ⊱━━━╮\n`;
+          text += `│\n`;
+          text += `│ 💰 Recompensa: *+${reward.toLocaleString()}*\n`;
+          text += `│ ✨ EXP: *+150*\n`;
+          
+          if (leveledUp) {
+            text += `│\n`;
+            text += `╰━━━━━━━━━━━━━━━━━━━━━╯\n\n`;
+            text += `╭━━━⊱ � *LEVEL UP!* 🌟 ⊱━━━╮\n`;
+            text += `│\n`;
+            text += `│ 📊 Nível atual: *${me.level}*\n`;
+            text += `│ ❤️ HP restante: *${Math.max(0, myHp)}*\n`;
+            text += `│\n`;
+            text += `╰━━━━━━━━━━━━━━━━━━━━━╯`;
+          } else {
+            text += `│ ❤️ HP restante: *${Math.max(0, myHp)}*\n`;
+            text += `│\n`;
+            text += `╰━━━━━━━━━━━━━━━━━━━━━╯`;
+          }
           
           saveEconomy(econ);
           return reply(text, { mentions: [target] });
@@ -4684,10 +5685,16 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           opponent.wallet += loss;
           opponent.exp = (opponent.exp || 0) + 150;
           
+          // Atualiza missão de duelo mesmo em derrota
+          updateQuestProgress(me, 'duel', 1);
+          
           text += battle;
-          text += `\n💀 *DERROTA!*\n\n`;
-          text += `💸 Perdeu: -${loss.toLocaleString()}\n\n`;
-          text += `💪 Treine mais e desafie novamente!`;
+          text += `\n╭━━━⊱ 💀 *DERROTA!* 💀 ⊱━━━╮\n`;
+          text += `│\n`;
+          text += `│ 💸 Perdeu: *-${loss.toLocaleString()}*\n`;
+          text += `│\n`;
+          text += `╰━━━━━━━━━━━━━━━━━━━━━╯\n\n`;
+          text += `💪 *Treine mais e desafie novamente!*`;
           
           saveEconomy(econ);
           return reply(text, { mentions: [target] });
@@ -4754,13 +5761,19 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           me.wallet += reward;
           me.exp = (me.exp || 0) + (arena.enemies * 50);
           
-          let text = `╭━━━⊱ 🏆 *VITÓRIA NA ARENA!* ⊱━━━╮\n`;
-          text += `│ Arena: ${arena.name}\n`;
-          text += `╰━━━━━━━━━━━━━━━━━━━━╯\n\n`;
-          text += `⚔️ Derrotou: ${wins}/${arena.enemies} inimigos\n\n`;
-          text += `💰 Prêmio: +${reward.toLocaleString()}\n`;
-          text += `✨ EXP: +${arena.enemies * 50}\n\n`;
-          text += `🎉 A multidão te aclama!`;
+          let text = `╭━━━⊱ 🏆 *VITÓRIA NA ARENA!* 🏆 ⊱━━━╮\n`;
+          text += `│\n`;
+          text += `│ 🏟️ Arena: *${arena.name}*\n`;
+          text += `│\n`;
+          text += `╰━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n`;
+          text += `⚔️ *Derrotou:* ${wins}/${arena.enemies} inimigos\n\n`;
+          text += `┌─⊱ 🎁 *RECOMPENSAS* ⊰─┐\n`;
+          text += `│\n`;
+          text += `│ 💰 Prêmio: *+${reward.toLocaleString()}*\n`;
+          text += `│ ✨ EXP: *+${arena.enemies * 50}*\n`;
+          text += `│\n`;
+          text += `└━━━━━━━━━━━━━━━━━━━━━┘\n\n`;
+          text += `🎉 *A multidão te aclama!*`;
           
           saveEconomy(econ);
           return reply(text);
@@ -4768,12 +5781,18 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
           const loss = Math.floor(me.wallet * 0.08);
           me.wallet = Math.max(0, me.wallet - loss);
           
-          let text = `╭━━━⊱ 💀 *DERROTA NA ARENA* ⊱━━━╮\n`;
-          text += `│ Arena: ${arena.name}\n`;
-          text += `╰━━━━━━━━━━━━━━━━━━━━╯\n\n`;
-          text += `⚔️ Derrotou: ${wins}/${arena.enemies} inimigos\n\n`;
-          text += `💸 Perdeu: -${loss.toLocaleString()}\n\n`;
-          text += `💪 Continue treinando!`;
+          let text = `╭━━━⊱ 💀 *DERROTA NA ARENA* 💀 ⊱━━━╮\n`;
+          text += `│\n`;
+          text += `│ 🏟️ Arena: *${arena.name}*\n`;
+          text += `│\n`;
+          text += `╰━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n`;
+          text += `⚔️ *Derrotou:* ${wins}/${arena.enemies} inimigos\n\n`;
+          text += `┌─⊱ 💸 *PERDAS* ⊰─┐\n`;
+          text += `│\n`;
+          text += `│ 💵 Moedas: *-${loss.toLocaleString()}*\n`;
+          text += `│\n`;
+          text += `└━━━━━━━━━━━━━━━━━━━━━┘\n\n`;
+          text += `💪 *Continue treinando!*`;
           
           saveEconomy(econ);
           return reply(text);
@@ -5092,8 +6111,7 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
       }
 
       case 'adotaruser':
-      case 'adotar':
-      case 'adopt': {
+      case 'adotarfilho': {
         if (!isGroup) return reply('⚔️ Este comando funciona apenas em grupos com Modo RPG ativo.');
         if (!groupData.modorpg) return reply(`⚔️ Modo RPG desativado! Use ${prefix}modorpg para ativar.`);
         
@@ -5790,24 +6808,36 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         const playerRoll = Math.floor(Math.random() * 6) + 1;
         const botRoll = Math.floor(Math.random() * 6) + 1;
         
-        let text = `╭━━━⊱ 🎲 *DADOS* ⊱━━━╮\n`;
-        text += `╰━━━━━━━━━━━━━━━━━━━━╯\n\n`;
-        text += `🎲 Você: ${playerRoll}\n`;
-        text += `🎲 Bot: ${botRoll}\n\n`;
+        let text = `╭━━━⊱ 🎲 *JOGO DE DADOS* 🎲 ⊱━━━╮\n`;
+        text += `╰━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n`;
+        text += `🎲 *Você:* ${playerRoll}\n`;
+        text += `🎲 *Bot:* ${botRoll}\n\n`;
+        text += `╭━━━━━━━━━━━━━━━━━━━━━╮\n`;
         
         if (playerRoll > botRoll) {
           const win = bet * 2;
           me.wallet += win;
-          text += `🎉 *VOCÊ GANHOU!*\n\n`;
-          text += `💰 +${win.toLocaleString()}`;
+          text += `│\n`;
+          text += `│ 🎉 *VOCÊ GANHOU!*\n`;
+          text += `│\n`;
+          text += `│ 💰 Ganhou: *+${win.toLocaleString()}*\n`;
+          text += `│\n`;
         } else if (playerRoll < botRoll) {
           me.wallet -= bet;
-          text += `😢 *VOCÊ PERDEU!*\n\n`;
-          text += `💸 -${bet.toLocaleString()}`;
+          text += `│\n`;
+          text += `│ 😢 *VOCÊ PERDEU!*\n`;
+          text += `│\n`;
+          text += `│ 💸 Perdeu: *-${bet.toLocaleString()}*\n`;
+          text += `│\n`;
         } else {
-          text += `🤝 *EMPATE!*\n\n`;
-          text += `💰 Aposta devolvida`;
+          text += `│\n`;
+          text += `│ 🤝 *EMPATE!*\n`;
+          text += `│\n`;
+          text += `│ 💰 *Aposta devolvida*\n`;
+          text += `│\n`;
         }
+        
+        text += `╰━━━━━━━━━━━━━━━━━━━━━╯`;
         
         saveEconomy(econ);
         return reply(text);
@@ -5905,18 +6935,37 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
             current: 0,
             best: 0,
             lastLogin: 0,
+            lastClaim: 0,
             rewards: []
           };
         }
         
         const now = Date.now();
-        const oneDay = 86400000;
+        const oneDay = 86400000; // 24 horas
+        const twoDays = oneDay * 2;
         const timeSinceLogin = now - me.streak.lastLogin;
         
-        // Verificar streak
-        if (timeSinceLogin > oneDay * 2) {
-          me.streak.current = 0; // Perdeu streak
+        // Verificar e atualizar streak
+        if (me.streak.lastLogin === 0) {
+          // Primeira vez usando o sistema
+          me.streak.current = 0;
+        } else if (timeSinceLogin > twoDays) {
+          // Perdeu o streak (mais de 2 dias)
+          me.streak.current = 0;
+        } else if (timeSinceLogin >= oneDay) {
+          // Passou 1 dia, pode incrementar
+          const timeSinceLastClaim = now - (me.streak.lastClaim || 0);
+          if (timeSinceLastClaim >= oneDay) {
+            me.streak.current++;
+            me.streak.lastClaim = now;
+            if (me.streak.current > me.streak.best) {
+              me.streak.best = me.streak.current;
+            }
+          }
         }
+        
+        // Atualiza lastLogin sempre que o comando é usado
+        me.streak.lastLogin = now;
         
         let text = `╭━━━⊱ 🔥 *STREAK* ⊱━━━╮\n`;
         text += `│ ${pushname}\n`;
@@ -5931,11 +6980,24 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         text += `│ 60 dias: 500.000 💰\n`;
         text += `└─────────────────\n\n`;
         
-        if (me.streak.current >= 7 && !me.streak.rewards.includes(7)) {
+        const rewards = [7, 15, 30, 60];
+        const hasReward = rewards.some(days => 
+          me.streak.current >= days && !me.streak.rewards.includes(days)
+        );
+        
+        if (hasReward) {
           text += `🎁 Recompensa disponível!\n`;
           text += `💡 Use ${prefix}reivindicar`;
         } else {
-          text += `💡 Use ${prefix}diario todos os dias!`;
+          const nextReward = rewards.find(days => me.streak.current < days);
+          if (nextReward) {
+            const daysLeft = nextReward - me.streak.current;
+            text += `💡 Próxima recompensa em ${daysLeft} dias!\n`;
+            text += `Use ${prefix}diario todos os dias para manter seu streak!`;
+          } else {
+            text += `🏆 Você desbloqueou todas as recompensas!\n`;
+            text += `Continue mantendo seu streak!`;
+          }
         }
         
         saveEconomy(econ);
@@ -6478,7 +7540,7 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         }
         try {
           await reply(`⏳ Só um segundinho, estou consultando o Swallow... ✨`);
-          const response = await ia.makeCognimaRequest('institute-of-science-tokyo/llama-3.1-swallow-70b-instruct-v0.1', q, null, KeyCog || null);
+          const response = await ia.makeCognimaRequest('qwen/qwen3-235b-a22b', q, null, KeyCog || null);
           await reply(response.data.choices[0].message.content);
         } catch (e) {
           console.error('Erro na API Swallow:', e);
@@ -6563,7 +7625,7 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         try {
           await reply('⏳ Aguarde enquanto preparo um resumo bem caprichado... ✨');
           const prompt = `Resuma o seguinte texto em poucos parágrafos, de forma clara e objetiva, destacando as informações mais importantes:\n\n${q}`;
-          const response = await ia.makeCognimaRequest('institute-of-science-tokyo/llama-3.1-swallow-70b-instruct-v0.1', prompt, null, KeyCog || null);
+          const response = await ia.makeCognimaRequest('qwen/qwen3-235b-a22b', prompt, null, KeyCog || null);
           await reply(response.data.choices[0].message.content);
         } catch (e) {
           console.error('Erro ao resumir texto:', e);
@@ -6602,7 +7664,7 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
             return reply(`😓 Ops, não encontrei conteúdo suficiente para resumir nessa página! Tente outra URL, tá? 🌐`);
           }
           const prompt = `Resuma o seguinte conteúdo extraído de uma página web em poucos parágrafos, de forma clara e objetiva, destacando os pontos principais:\n\n${cleanText.substring(0, 5000)}`;
-          const iaResponse = await ia.makeCognimaRequest('institute-of-science-tokyo/llama-3.1-swallow-70b-instruct-v0.1', prompt, null, KeyCog || null);
+          const iaResponse = await ia.makeCognimaRequest('qwen/qwen3-235b-a22b', prompt, null, KeyCog || null);
           await reply(iaResponse.data.choices[0].message.content);
         } catch (e) {
           console.error('Erro ao resumir URL:', e.message);
@@ -6629,7 +7691,7 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         try {
           await reply('⏳ Um segundinho, estou pensando em ideias incríveis... ✨');
           const prompt = `Gere 15 ideias criativas e detalhadas para o seguinte tema: ${q}`;
-          const response = await ia.makeCognimaRequest('institute-of-science-tokyo/llama-3.1-swallow-70b-instruct-v0.1', prompt, null, KeyCog || null);
+          const response = await ia.makeCognimaRequest('qwen/qwen3-235b-a22b', prompt, null, KeyCog || null);
           await reply(response.data.choices[0].message.content);
         } catch (e) {
           console.error('Erro ao gerar ideias:', e);
@@ -6652,7 +7714,7 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         try {
           await reply('⏳ Um momentinho, estou preparando uma explicação bem clara... ✨');
           const prompt = `Explique o seguinte conceito de forma simples e clara, como se fosse para alguém sem conhecimento prévio: ${q}`;
-          const response = await ia.makeCognimaRequest('institute-of-science-tokyo/llama-3.1-swallow-70b-instruct-v0.1', prompt, null, KeyCog || null);
+          const response = await ia.makeCognimaRequest('qwen/qwen3-235b-a22b', prompt, null, KeyCog || null);
           await reply(response.data.choices[0].message.content);
         } catch (e) {
           console.error('Erro ao explicar conceito:', e);
@@ -6675,7 +7737,7 @@ Capacidade: ${cap === '∞' ? 'ilimitada' : fmt(cap)}
         try {
           await reply('⏳ Aguarde enquanto dou um polimento no seu texto... ✨');
           const prompt = `Corrija os erros gramaticais, ortográficos e de estilo no seguinte texto, mantendo o significado original: ${q}`;
-          const response = await ia.makeCognimaRequest('institute-of-science-tokyo/llama-3.1-swallow-70b-instruct-v0.1', prompt, null, KeyCog || null);
+          const response = await ia.makeCognimaRequest('qwen/qwen3-235b-a22b', prompt, null, KeyCog || null);
           await reply(response.data.choices[0].message.content);
         } catch (e) {
           console.error('Erro ao corrigir texto:', e);
@@ -6715,7 +7777,7 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
           const idioma = partes[0].trim();
           const texto = partes.slice(1).join('|').trim();
           const prompt = `Traduza o seguinte texto para ${idioma}:\n\n${texto}\n\nForneça apenas a tradução, sem explicações adicionais.`;
-          const bahz = await ia.makeCognimaRequest('institute-of-science-tokyo/llama-3.1-swallow-70b-instruct-v0.1', prompt, null, KeyCog || null);
+          const bahz = await ia.makeCognimaRequest('qwen/qwen3-235b-a22b', prompt, null, KeyCog || null);
           await reply(`🌐✨ *Prontinho! Sua tradução para ${idioma.toUpperCase()} está aqui:*\n\n${bahz.data.choices[0].message.content}`);
         } catch (e) {
           console.error("Erro ao traduzir texto:", e);
@@ -6865,7 +7927,7 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
           }
           if (!definicaoEncontrada) {
             const prompt = `Defina a palavra "${palavra}" em português de forma completa e fofa. Inclua a classe gramatical, os principais significados e um exemplo de uso em uma frase curta e bonitinha.`;
-            const bahz = await ia.makeCognimaRequest('institute-of-science-tokyo/llama-3.1-swallow-70b-instruct-v0.1', prompt, null, KeyCog || null);
+            const bahz = await ia.makeCognimaRequest('qwen/qwen3-235b-a22b', prompt, null, KeyCog || null);
             await reply(`${bahz.data.choices[0].message.content}`);
             definicaoEncontrada = true;
           }
@@ -6897,16 +7959,58 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
         }
         break;
       case 'addsubdono':
-        if (!isOwner || isSubOwner) return reply("🚫 Apenas o Dono principal pode adicionar subdonos!");
+        if (!isOwner) return reply("🚫 Apenas o Dono principal pode adicionar subdonos!");
+        if (isSubOwner && !isOwner) return reply("🚫 Subdonos não podem adicionar outros subdonos!");
         try {
           let targetUserId;
           
           if (menc_jid2 && menc_jid2.length > 0) {
+            // Pegar o LID do usuário mencionado
             targetUserId = menc_jid2[0];
+            
+            // Tentar obter o LID real do participante
+            if (isGroup && groupMetadata?.participants) {
+              const participant = groupMetadata.participants.find(p => 
+                p.id === targetUserId || p.lid === targetUserId
+              );
+              if (participant && participant.lid) {
+                targetUserId = participant.lid;
+              }
+            } else {
+              // Se não for grupo, usar onWhatsApp para pegar LID
+              try {
+                const [result] = await nazu.onWhatsApp(targetUserId.replace(/@s\.whatsapp\.net|@lid/g, ''));
+                if (result && result.jid) {
+                  targetUserId = result.jid;
+                }
+              } catch (err) {
+                console.log('Não foi possível obter LID via onWhatsApp:', err.message);
+              }
+            }
           } else if (q && q.trim()) {
             const cleanNumber = q.replace(/\D/g, '');
             if (cleanNumber.length >= 10) {
               targetUserId = `${cleanNumber}@s.whatsapp.net`;
+              
+              // Tentar buscar LID
+              if (isGroup && groupMetadata?.participants) {
+                const participant = groupMetadata.participants.find(p => 
+                  p.id === targetUserId
+                );
+                if (participant && participant.lid) {
+                  targetUserId = participant.lid;
+                }
+              } else {
+                // Se não for grupo, usar onWhatsApp para pegar LID
+                try {
+                  const [result] = await nazu.onWhatsApp(cleanNumber);
+                  if (result && result.jid) {
+                    targetUserId = result.jid;
+                  }
+                } catch (err) {
+                  console.log('Não foi possível obter LID via onWhatsApp:', err.message);
+                }
+              }
             } else {
               return reply("❌ Número inválido! Use um número completo (ex: 5511999998888)");
             }
@@ -6923,16 +8027,57 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
         break;
       case 'remsubdono':
       case 'rmsubdono':
-        if (!isOwner || isSubOwner) return reply("🚫 Apenas o Dono principal pode remover subdonos!");
+        if (!isOwner) return reply("🚫 Apenas o Dono principal pode remover subdonos!");
+        if (isSubOwner && !isOwner) return reply("🚫 Subdonos não podem remover outros subdonos!");
         try {
           let targetUserId;
           
           if (menc_jid2 && menc_jid2.length > 0) {
             targetUserId = menc_jid2[0];
+            
+            // Tentar obter o LID real
+            if (isGroup && groupMetadata?.participants) {
+              const participant = groupMetadata.participants.find(p => 
+                p.id === targetUserId || p.lid === targetUserId
+              );
+              if (participant && participant.lid) {
+                targetUserId = participant.lid;
+              }
+            } else {
+              // Se não for grupo, usar onWhatsApp para pegar LID
+              try {
+                const [result] = await nazu.onWhatsApp(targetUserId.replace(/@s\.whatsapp\.net|@lid/g, ''));
+                if (result && result.jid) {
+                  targetUserId = result.jid;
+                }
+              } catch (err) {
+                console.log('Não foi possível obter LID via onWhatsApp:', err.message);
+              }
+            }
           } else if (q && q.trim()) {
             const cleanNumber = q.replace(/\D/g, '');
             if (cleanNumber.length >= 10) {
               targetUserId = `${cleanNumber}@s.whatsapp.net`;
+              
+              // Tentar buscar LID
+              if (isGroup && groupMetadata?.participants) {
+                const participant = groupMetadata.participants.find(p => 
+                  p.id === targetUserId
+                );
+                if (participant && participant.lid) {
+                  targetUserId = participant.lid;
+                }
+              } else {
+                // Se não for grupo, usar onWhatsApp para pegar LID
+                try {
+                  const [result] = await nazu.onWhatsApp(cleanNumber);
+                  if (result && result.jid) {
+                    targetUserId = result.jid;
+                  }
+                } catch (err) {
+                  console.log('Não foi possível obter LID via onWhatsApp:', err.message);
+                }
+              }
             } else {
               const subdonos = getSubdonos();
               const index = parseInt(q) - 1;
@@ -6980,6 +8125,181 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
         } catch (e) {
           console.error("Erro ao listar subdonos:", e);
           await reply("❌ Ocorreu um erro inesperado ao tentar listar os subdonos.");
+        }
+        break;
+
+      case 'addsubbot':
+        if (!isOwner) return reply("🚫 Apenas o Dono principal pode adicionar sub-bots!");
+        try {
+          const subBotManager = require('./utils/subBotManager.js');
+          
+          if (!q || !q.trim()) {
+            return reply(`📝 *Como usar:*\n\n${prefix}addsubbot <número>\n\n*Exemplo:*\n${prefix}addsubbot 5511999999999\n\n⚠️ O número deve incluir o código do país (Brasil: 55)`);
+          }
+          
+          const phoneNumber = q.trim().replace(/\D/g, '');
+          
+          if (!/^\d{10,15}$/.test(phoneNumber) || !phoneNumber.startsWith('55')) {
+            return reply('❌ Número inválido! Use um número válido com código de país.\n\n*Exemplo:* 5511999999999');
+          }
+          
+          await reply('⏳ Verificando número e registrando sub-bot... Aguarde...');
+          
+          // Verifica se o número existe no WhatsApp e pega o LID
+          try {
+            const [result] = await nazu.onWhatsApp(phoneNumber);
+            
+            if (!result || !result.exists) {
+              return reply(`❌ O número ${phoneNumber} não está registrado no WhatsApp!`);
+            }
+            
+            const subBotLid = result.lid;
+            
+            const addResult = await subBotManager.addSubBot(phoneNumber, numerodono, subBotLid);
+            
+            await reply(addResult.message);
+          } catch (verifyError) {
+            console.error("Erro ao verificar número:", verifyError);
+            return reply(`❌ Erro ao verificar o número no WhatsApp: ${verifyError.message}`);
+          }
+          
+        } catch (error) {
+          console.error("Erro ao adicionar sub-bot:", error);
+          await reply(`❌ Erro ao criar sub-bot: ${error.message}`);
+        }
+        break;
+
+      case 'removesubbot':
+      case 'delsubbot':
+      case 'rmsubbot':
+        if (!isOwner) return reply("🚫 Apenas o Dono principal pode remover sub-bots!");
+        try {
+          const subBotManager = require('./utils/subBotManager.js');
+          
+          if (!q || !q.trim()) {
+            const listResult = subBotManager.listSubBots();
+            if (!listResult.success || listResult.subbots.length === 0) {
+              return reply('❌ Nenhum sub-bot cadastrado para remover.');
+            }
+            
+            let msg = `📋 *Sub-Bots Disponíveis:*\n\n`;
+            listResult.subbots.forEach((bot, index) => {
+              msg += `${index + 1}. *ID:* ${bot.id.substring(0, 20)}...\n`;
+              msg += `   📱 *Número:* ${bot.phoneNumber}\n`;
+              msg += `   🔌 *Status:* ${bot.status}\n\n`;
+            });
+            msg += `\n💡 *Use:* ${prefix}removesubbot <número>\n\n*Exemplo:*\n${prefix}removesubbot 1`;
+            
+            return reply(msg);
+          }
+          
+          // Tenta remover por índice primeiro
+          const listResult = subBotManager.listSubBots();
+          if (listResult.success && listResult.subbots.length > 0) {
+            const index = parseInt(q) - 1;
+            if (index >= 0 && index < listResult.subbots.length) {
+              const botId = listResult.subbots[index].id;
+              await reply('⏳ Removendo sub-bot... Aguarde...');
+              const result = await subBotManager.removeSubBot(botId);
+              return reply(result.message);
+            }
+          }
+          
+          // Se não for índice, tenta pelo ID direto
+          await reply('⏳ Removendo sub-bot... Aguarde...');
+          const result = await subBotManager.removeSubBot(q.trim());
+          await reply(result.message);
+        } catch (error) {
+          console.error("Erro ao remover sub-bot:", error);
+          await reply(`❌ Erro ao remover sub-bot: ${error.message}`);
+        }
+        break;
+
+      case 'listarsubbots':
+      case 'listsubbots':
+      case 'subbots':
+        if (!isOwner) return reply("🚫 Apenas o Dono principal pode ver os sub-bots!");
+        try {
+          const subBotManager = require('./utils/subBotManager.js');
+          
+          const result = subBotManager.listSubBots();
+          
+          if (!result.success) {
+            return reply(result.message);
+          }
+          
+          if (result.subbots.length === 0) {
+            return reply('📋 *Nenhum sub-bot cadastrado.*\n\n💡 Use `!addsubbot <número>` para adicionar um sub-bot.');
+          }
+          
+          let msg = `🤖 *Sub-Bots Ativos* 🤖\n`;
+          msg += `═══════════════════\n\n`;
+          
+          result.subbots.forEach((bot, index) => {
+            const statusEmoji = bot.status === 'conectado' ? '🟢' : bot.status === 'aguardando_pareamento' ? '🟡' : '🔴';
+            const activeText = bot.isActive ? '✅ Ativo' : '⏸️ Inativo';
+            
+            msg += `*${index + 1}.* ${statusEmoji} ${activeText}\n`;
+            msg += `📱 *Número:* ${bot.phoneNumber}\n`;
+            msg += `🆔 *ID:* \`${bot.id.substring(0, 25)}...\`\n`;
+            msg += `📊 *Status:* ${bot.status}\n`;
+            msg += `📅 *Criado:* ${new Date(bot.createdAt).toLocaleString('pt-BR')}\n`;
+            msg += `🔌 *Última conexão:* ${bot.lastConnection !== 'Nunca' ? new Date(bot.lastConnection).toLocaleString('pt-BR') : 'Nunca'}\n`;
+            msg += `\n`;
+          });
+          
+          msg += `═══════════════════\n`;
+          msg += `Total: ${result.subbots.length} sub-bot(s)`;
+          
+          await reply(msg);
+        } catch (error) {
+          console.error("Erro ao listar sub-bots:", error);
+          await reply(`❌ Erro ao listar sub-bots: ${error.message}`);
+        }
+        break;
+
+      case 'conectarsubbot':
+      case 'reconnectsubbot':
+        if (!isOwner) return reply("🚫 Apenas o Dono principal pode reconectar sub-bots!");
+        try {
+          const subBotManager = require('./utils/subBotManager.js');
+          
+          if (!q || !q.trim()) {
+            return reply(`📝 *Como usar:*\n\n${prefix}conectarsubbot <id>\n\n*Exemplo:*\n${prefix}conectarsubbot subbot_1234567890_abc123\n\n💡 Use \`${prefix}listarsubbots\` para ver os IDs`);
+          }
+          
+          const botId = q.trim();
+          
+          await reply('⏳ Conectando sub-bot... Aguarde...');
+          
+          const result = await subBotManager.reconnectSubBot(botId);
+          
+          await reply(result.message);
+        } catch (error) {
+          console.error("Erro ao reconectar sub-bot:", error);
+          await reply(`❌ Erro ao reconectar sub-bot: ${error.message}`);
+        }
+        break;
+
+      case 'gerarcodigo':
+      case 'pairingcode':
+      case 'codigosubbot':
+        try {
+          const subBotManager = require('./utils/subBotManager.js');
+          
+          // Verifica se o usuário é um sub-bot cadastrado
+          const result = await subBotManager.generatePairingCodeForSubBot(sender);
+          
+          if (!result.success) {
+            return reply(result.message);
+          }
+          
+          // Envia o código no privado do sub-bot
+          await reply(result.message);
+          
+        } catch (error) {
+          console.error("Erro ao gerar código de pareamento:", error);
+          await reply(`❌ Erro ao gerar código: ${error.message}`);
         }
         break;
 
@@ -7069,6 +8389,240 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
           await reply("❌ Ocorreu um erro inesperado.");
         }
         break;
+
+      case 'atualizar':
+      case 'update':
+      case 'atualizarbot':
+        if (!isOwner || isSubOwner) return reply("🚫 Apenas o Dono principal pode atualizar o bot!");
+        
+        try {
+          const updateScriptPath = pathz.join(__dirname, '.scripts', 'update.js');
+          
+          // Verifica se o script de atualização existe
+          if (!fs.existsSync(updateScriptPath)) {
+            return reply("❌ Script de atualização não encontrado!\n\n📂 Caminho esperado: dados/src/.scripts/update.js");
+          }
+
+          // Se não passou o parâmetro "sim", mostra o aviso
+          if (!q || q.toLowerCase() !== 'sim') {
+            const avisoMsg = `⚠️ *ATENÇÃO - ATUALIZAÇÃO DO BOT* ⚠️
+
+┏━━━━━━━━━━━━━━━━━━━━━
+┃ 📢 *AVISOS IMPORTANTES:*
+┣━━━━━━━━━━━━━━━━━━━━━
+┃
+┃ ⚠️ Edições manuais no código 
+┃    serão *PERDIDAS*
+┃
+┃ ✅ Banco de dados será 
+┃    *PRESERVADO*
+┃
+┃ ✅ Configurações (config.json)
+┃    serão *MANTIDAS*
+┃
+┃ ✅ Mídias serão *PRESERVADAS*
+┃
+┃ 🔒 Backup automático será criado
+┃
+┃ ⏸️ Processamento de mensagens
+┃    será *PAUSADO* durante update
+┃
+┣━━━━━━━━━━━━━━━━━━━━━
+┃ 💡 *RECOMENDAÇÃO:*
+┃ Faça um backup manual antes!
+┣━━━━━━━━━━━━━━━━━━━━━
+┃
+┃ 📝 Para confirmar, use:
+┃ ${prefix}atualizar sim
+┃
+┗━━━━━━━━━━━━━━━━━━━━━`;
+            
+            return reply(avisoMsg);
+          }
+
+          // Confirmação recebida, iniciar atualização
+          await reply("🚀 *INICIANDO ATUALIZAÇÃO...*\n\n⏸️ Pausando processamento de mensagens...");
+
+          // Pausa o processamento de mensagens
+          const messageQueueModule = require('./connect');
+          if (messageQueueModule.messageQueue && typeof messageQueueModule.messageQueue.pause === 'function') {
+            messageQueueModule.messageQueue.pause();
+            await reply("✅ Processamento pausado com sucesso!\n\n🔄 Iniciando script de atualização...");
+          }
+
+          // Cria o processo de atualização
+          const updateProcess = spawn('node', [updateScriptPath], {
+            cwd: pathz.join(__dirname, '..', '..'),
+            stdio: ['ignore', 'pipe', 'pipe'],
+            detached: false
+          });
+
+          let outputBuffer = '';
+          const messagesSent = new Set(); // Rastreia mensagens já enviadas para evitar duplicatas
+          const messageQueue = []; // Fila de mensagens pendentes
+          let isProcessingQueue = false;
+
+          // Mapeamento de triggers para mensagens
+          const updateMessages = {
+            'Verificando requisitos': '🔍 Verificando requisitos do sistema...',
+            'Criando backup': '📁 Criando backup dos arquivos importantes...',
+            'Backup salvo': '✅ Backup criado com sucesso!',
+            'Baixando a versão': '📥 Baixando atualização do GitHub...',
+            'Download concluído': '✅ Download concluído!\n\n🧹 Limpando arquivos antigos...',
+            'Limpeza concluída': '✅ Limpeza concluída!\n\n🚀 Aplicando atualização...',
+            'Atualização aplicada': '✅ Atualização aplicada!\n\n📂 Restaurando dados preservados...',
+            'Backup restaurado': '✅ Dados restaurados!\n\n📦 Instalando dependências...',
+            'Instalando dependências': '📦 Instalando/verificando dependências...\n⏳ Isso pode levar alguns minutos...',
+            'Dependências instaladas': '✅ Dependências instaladas com sucesso!'
+          };
+
+          // Processa a fila de mensagens sequencialmente
+          const processMessageQueue = async () => {
+            if (isProcessingQueue || messageQueue.length === 0) return;
+            
+            isProcessingQueue = true;
+            while (messageQueue.length > 0) {
+              const message = messageQueue.shift();
+              try {
+                await reply(message);
+                await new Promise(resolve => setTimeout(resolve, 1500)); // Delay entre mensagens
+              } catch (e) {
+                console.error('Erro ao enviar update:', e);
+              }
+            }
+            isProcessingQueue = false;
+          };
+
+          // Adiciona mensagem à fila se não foi enviada ainda
+          const queueUpdate = (trigger, message) => {
+            if (!messagesSent.has(trigger)) {
+              messagesSent.add(trigger);
+              messageQueue.push(message);
+              processMessageQueue();
+            }
+          };
+
+          // Captura stdout
+          updateProcess.stdout.on('data', async (data) => {
+            const output = data.toString();
+            console.log('UPDATE:', output);
+            outputBuffer += output;
+
+            // Verifica cada trigger e enfileira a mensagem correspondente
+            for (const [trigger, message] of Object.entries(updateMessages)) {
+              if (output.includes(trigger)) {
+                queueUpdate(trigger, message);
+              }
+            }
+          });
+
+          // Captura stderr
+          updateProcess.stderr.on('data', (data) => {
+            const error = data.toString();
+            console.error('UPDATE ERROR:', error);
+          });
+
+          // Quando o processo terminar
+          updateProcess.on('close', async (code) => {
+            if (code === 0) {
+              await reply(`✅ *ATUALIZAÇÃO CONCLUÍDA COM SUCESSO!*
+
+🎉 O bot foi atualizado para a versão mais recente!
+
+🔄 Reiniciando automaticamente em 3 segundos...`);
+
+              // Aguarda 3 segundos antes de reiniciar
+              setTimeout(async () => {
+                await reply('🔄 Reiniciando agora...');
+                
+                // Aguarda mais 1 segundo para garantir que a mensagem foi enviada
+                setTimeout(() => {
+                  console.log('[UPDATE] Reiniciando após atualização...');
+                  process.exit(0); // Exit code 0 indica sucesso, o gerenciador de processos deve reiniciar
+                }, 1000);
+              }, 3000);
+            } else {
+              await reply(`❌ *ERRO NA ATUALIZAÇÃO!*
+
+⚠️ O processo de atualização falhou com código: ${code}
+
+🔧 *O que fazer:*
+┃
+┃ 1️⃣ Verifique sua conexão com a internet
+┃ 2️⃣ Certifique-se de ter Git instalado
+┃ 3️⃣ Tente novamente em alguns minutos
+┃ 4️⃣ Se persistir, atualize manualmente:
+┃    cd dados/src/.scripts
+┃    node update.js
+┃
+┗━━━━━━━━━━━━━━━━━━━━━
+
+📂 Backup foi preservado para segurança.`);
+
+              // Retoma o processamento de mensagens
+              if (messageQueueModule.messageQueue && typeof messageQueueModule.messageQueue.resume === 'function') {
+                messageQueueModule.messageQueue.resume();
+              }
+            }
+          });
+
+          // Timeout de segurança (15 minutos)
+          setTimeout(async () => {
+            if (!updateProcess.killed) {
+              updateProcess.kill();
+              await reply("⏱️ Timeout na atualização (15min).\n\n❌ Processo cancelado por segurança.\n\n🔄 Retomando processamento de mensagens...");
+              
+              if (messageQueueModule.messageQueue && typeof messageQueueModule.messageQueue.resume === 'function') {
+                messageQueueModule.messageQueue.resume();
+              }
+            }
+          }, 15 * 60 * 1000); // 15 minutos
+
+        } catch (e) {
+          console.error("Erro no comando atualizar:", e);
+          await reply(`❌ Erro ao executar atualização: ${e.message}\n\n🔄 Retomando processamento de mensagens...`);
+          
+          // Garante retomar o processamento em caso de erro
+          try {
+            const messageQueueModule = require('./connect');
+            if (messageQueueModule.messageQueue && typeof messageQueueModule.messageQueue.resume === 'function') {
+              messageQueueModule.messageQueue.resume();
+            }
+          } catch (resumeError) {
+            console.error('Erro ao retomar processamento:', resumeError);
+          }
+        }
+        break;
+
+      case 'reiniciar':
+      case 'restart':
+      case 'reboot':
+        if (!isOwner) return reply("🚫 Apenas o Dono principal pode reiniciar o bot!");
+        
+        try {
+          await reply(`🔄 *REINICIANDO O BOT...*
+
+⏸️ Pausando processamento de mensagens...
+🔄 O bot voltará online em alguns segundos!`);
+
+          // Pausa o processamento de mensagens
+          const messageQueueModule = require('./connect');
+          if (messageQueueModule.messageQueue && typeof messageQueueModule.messageQueue.pause === 'function') {
+            messageQueueModule.messageQueue.pause();
+          }
+
+          // Aguarda 2 segundos para garantir que a mensagem foi enviada
+          setTimeout(() => {
+            console.log('[RESTART] Reiniciando bot via comando...');
+            process.exit(0); // Exit code 0 indica reinício intencional
+          }, 2000);
+
+        } catch (e) {
+          console.error("Erro no comando reiniciar:", e);
+          await reply(`❌ Erro ao tentar reiniciar: ${e.message}`);
+        }
+        break;
+
       case 'listaralugueis':
       case 'aluguelist':
       case 'listaluguel':
@@ -7144,7 +8698,37 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
         };
         const nextLevelXp = calculateNextLevelXp(userDataLevel.level);
         const xpToNextLevel = nextLevelXp - userDataLevel.xp;
-        await reply(`🎚️ *Seu Nível*\n\n` + `🏅 *Nível:* ${userDataLevel.level}\n` + `🔹 *XP:* ${userDataLevel.xp} / ${nextLevelXp}\n` + `🎖️ *Patente:* ${userDataLevel.patent}\n` + `📈 *Falta para o próximo nível:* ${xpToNextLevel} XP\n`);
+        const percentProgress = Math.floor((userDataLevel.xp / nextLevelXp) * 100);
+        const progressBar = '█'.repeat(Math.floor(percentProgress / 10)) + '░'.repeat(10 - Math.floor(percentProgress / 10));
+        
+        let levelText = `╭━━━⊱ 📊 *STATUS DE NÍVEL* ⊱━━━╮\n`;
+        levelText += `│\n`;
+        levelText += `│ 👤 *Jogador:* ${pushname}\n`;
+        levelText += `│\n`;
+        levelText += `├─────────────────────\n`;
+        levelText += `│\n`;
+        levelText += `│ 🏅 *Nível Atual:* ${userDataLevel.level}\n`;
+        levelText += `│ 🎖️ *Patente:* ${userDataLevel.patent}\n`;
+        levelText += `│\n`;
+        levelText += `├─────────────────────\n`;
+        levelText += `│\n`;
+        levelText += `│ ✨ *Experiência:*\n`;
+        levelText += `│ └─ ${userDataLevel.xp} / ${nextLevelXp} XP\n`;
+        levelText += `│\n`;
+        levelText += `│ 📈 *Progresso:*\n`;
+        levelText += `│ └─ [${progressBar}] ${percentProgress}%\n`;
+        levelText += `│\n`;
+        levelText += `│ 🎯 *Falta:* ${xpToNextLevel} XP\n`;
+        levelText += `│\n`;
+        levelText += `├─────────────────────\n`;
+        levelText += `│\n`;
+        levelText += `│ 💬 *Mensagens:* ${userDataLevel.messages || 0}\n`;
+        levelText += `│ ⚡ *Comandos:* ${userDataLevel.commands || 0}\n`;
+        levelText += `│\n`;
+        levelText += `╰━━━━━━━━━━━━━━━━━━━━╯\n\n`;
+        levelText += `💡 Continue ativo para ganhar XP!`;
+        
+        await reply(levelText);
         break;
       case 'addxp':
         if (!isOwner) return reply("Apenas o dono pode usar este comando.");
@@ -7260,6 +8844,7 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
         }
         break;
       case 'gerarcodigo':
+      case 'gerarcod':
         if (!isOwner) return reply("🚫 Apenas o Dono principal pode gerar códigos!");
         try {
           const parts = q.trim().split(' ');
@@ -7723,19 +9308,25 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
       case 'addnopref':
         try {
           if (!isOwner) return reply(OWNER_ONLY_MESSAGE);
-          if (!q || !q.includes('/')) return reply(`Por favor, forneça a mensagem e o comando separados por /. Ex: ${groupPrefix}addnoprefix 😸/ban`);
-          const [trigger, targetCommand] = q.split('/').map(s => s.trim());
-          if (!trigger || !targetCommand) return reply("Formato inválido. Use: mensagem/comando");
+          if (!q || !q.includes('/')) return reply(`Por favor, forneça a mensagem e o comando separados por /. Ex: ${groupPrefix}addnoprefix f/grupo f\nVocê pode incluir parâmetros fixos no comando!`);
+          const [trigger, ...commandParts] = q.split('/');
+          const targetCommand = commandParts.join('/').trim();
+          if (!trigger.trim() || !targetCommand) return reply("Formato inválido. Use: mensagem/comando [parâmetros]");
           const noPrefixCommands = loadNoPrefixCommands();
-          if (noPrefixCommands.some(cmd => cmd.trigger === trigger)) {
-            return reply(`A mensagem "${trigger}" já está mapeada para um comando.`);
+          if (noPrefixCommands.some(cmd => cmd.trigger === trigger.trim())) {
+            return reply(`A mensagem "${trigger.trim()}" já está mapeada para um comando.`);
           }
+          const commandWords = targetCommand.split(' ');
+          const baseCommand = normalizar(commandWords[0]);
+          const fixedParams = commandWords.slice(1).join(' ');
+          
           noPrefixCommands.push({
-            trigger,
-            command: normalizar(targetCommand)
+            trigger: trigger.trim(),
+            command: baseCommand,
+            fixedParams: fixedParams || ''
           });
           if (saveNoPrefixCommands(noPrefixCommands)) {
-            await reply(`✅ Comando sem prefixo adicionado!\nMensagem: ${trigger}\nComando: ${targetCommand}`);
+            await reply(`✅ Comando sem prefixo adicionado!\nMensagem: ${trigger.trim()}\nComando: ${targetCommand}`);
           } else {
             await reply("😥 Erro ao salvar o comando sem prefixo. Tente novamente!");
           }
@@ -7752,8 +9343,8 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
           if (noPrefixCommands.length === 0) return reply("📜 Nenhum comando sem prefixo definido.");
           let responseText = `📜 *Comandos Sem Prefixo do Grupo ${groupName}*\n\n`;
           noPrefixCommands.forEach((item, index) => {
-            
-            responseText += `${index + 1}. Mensagem: ${item.trigger}\n   Comando: ${item.command}\n`;
+            const fullCommand = item.fixedParams ? `${item.command} ${item.fixedParams}` : item.command;
+            responseText += `${index + 1}. Mensagem: ${item.trigger}\n   Comando: ${fullCommand}\n`;
           });
           await reply(responseText);
         } catch (e) {
@@ -7783,19 +9374,25 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
       case 'addalias':
         try {
           if (!isOwner) return reply(OWNER_ONLY_MESSAGE);
-          if (!q || !q.includes('/')) return reply(`Por favor, forneça o apelido e o comando separados por /. Ex: ${groupPrefix}addalias h/hidetag`);
-          const [alias, targetCommand] = q.split('/').map(s => s.trim());
-          if (!alias || !targetCommand) return reply("Formato inválido. Use: apelido/comando");
+          if (!q || !q.includes('/')) return reply(`Por favor, forneça o apelido e o comando separados por /. Ex: ${groupPrefix}addalias h/hidetag\nVocê pode incluir parâmetros fixos no comando!`);
+          const [alias, ...commandParts] = q.split('/');
+          const targetCommand = commandParts.join('/').trim();
+          if (!alias.trim() || !targetCommand) return reply("Formato inválido. Use: apelido/comando [parâmetros]");
           const aliases = loadCommandAliases();
-          if (aliases.some(item => item.alias === normalizar(alias))) {
-            return reply(`O apelido "${alias}" já está em uso.`);
+          if (aliases.some(item => item.alias === normalizar(alias.trim()))) {
+            return reply(`O apelido "${alias.trim()}" já está em uso.`);
           }
+          const commandWords = targetCommand.split(' ');
+          const baseCommand = normalizar(commandWords[0]);
+          const fixedParams = commandWords.slice(1).join(' ');
+          
           aliases.push({
-            alias: normalizar(alias),
-            command: normalizar(targetCommand)
+            alias: normalizar(alias.trim()),
+            command: baseCommand,
+            fixedParams: fixedParams || ''
           });
           if (saveCommandAliases(aliases)) {
-            await reply(`✅ Apelido adicionado!\nApelido: ${groupPrefix}${alias}\nComando: ${groupPrefix}${targetCommand}`);
+            await reply(`✅ Apelido adicionado!\nApelido: ${groupPrefix}${alias.trim()}\nComando: ${groupPrefix}${targetCommand}`);
           } else {
             await reply("😥 Erro ao salvar o apelido. Tente novamente!");
           }
@@ -7811,8 +9408,8 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
           if (aliases.length === 0) return reply("📜 Nenhum apelido de comando definido.");
           let responseText = `📜 *Apelidos de Comandos do Grupo ${groupName}*\n\n`;
           aliases.forEach((item, index) => {
-            
-            responseText += `${index + 1}. Apelido: ${groupPrefix}${item.alias}\n   Comando: ${groupPrefix}${item.command}\n`;
+            const fullCommand = item.fixedParams ? `${item.command} ${item.fixedParams}` : item.command;
+            responseText += `${index + 1}. Apelido: ${groupPrefix}${item.alias}\n   Comando: ${groupPrefix}${fullCommand}\n`;
           });
           await reply(responseText);
         } catch (e) {
@@ -8228,7 +9825,7 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
       case 'gerarnick':
       case 'nickgenerator':
         try {
-          if (!q) return reply(`🎮 *GERADOR DE NICK*\n\n📝 *Como usar:*\n• Digite o nick após o comando\n• Ex: ${prefix}nick LEOMDZ`);
+          if (!q) return reply(`🎮 *GERADOR DE NICK*\n\n📝 *Como usar:*\n• Digite o nick após o comando\n• Ex: ${prefix}nick LEOMODZ`);
           var datzn;
           datzn = await styleText(q);
           await reply(datzn.join('\n'));
@@ -8284,25 +9881,22 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
       case 'assistir':
         try {
           if (!q) return reply('Cadê o nome do filme ou episódio de série? 🤔');
+          
+          // Verificar se tem API key
+          if (!KeyCog) {
+            await ia.notifyOwnerAboutApiKey(nazu, nmrdn, 'API key não configurada');
+            return reply(API_KEY_REQUIRED_MESSAGE);
+          }
+          
           await reply('Um momento, estou buscando as informações para você 🕵️‍♂️');
           var datyz;
-          datyz = await FilmesDL(q);
+          datyz = await FilmesDL(q, KeyCog);
           if (!datyz || !datyz.url) return reply('Desculpe, não consegui encontrar nada. Tente com outro nome de filme ou série. 😔');
-          let bannerBuf = null;
-          try {
-            bannerBuf = await banner.Filme(datyz.img, datyz.name, datyz.url);
-          } catch (be) { console.error('Erro ao gerar banner Filme:', be); }
-          if (bannerBuf) {
-            await nazu.sendMessage(from, {
-              image: bannerBuf,
-              caption: `Aqui está o que encontrei! 🎬\n\n*Nome*: ${datyz.name}\n🔗 *Assista:* ${datyz.url}`
-            }, { quoted: info });
-          } else {
-            await nazu.sendMessage(from, {
-              image: { url: datyz.img },
-              caption: `Aqui está o que encontrei! 🎬\n\n*Nome*: ${datyz.name}\n🔗 *Assista:* ${datyz.url}`
-            }, { quoted: info });
-          }
+          
+          await nazu.sendMessage(from, {
+            image: { url: datyz.img },
+            caption: `Aqui está o que encontrei! 🎬\n\n*Nome*: ${datyz.name}\n🔗 *Assista:* ${datyz.url}`
+          }, { quoted: info });
         } catch (e) {
           console.error(e);
           await reply("❌ Ocorreu um erro interno. Tente novamente em alguns minutos.");
@@ -8395,7 +9989,16 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
       case 'ytmp3':
         try {
           if (!q) {
-            return reply(`📝 Digite o nome da música ou um link do YouTube.\n\n📌 *Exemplo:* ${prefix + command} Back to Black`);
+            return reply(`╭━━━⊱ 🎵 *YOUTUBE MP3* 🎵 ⊱━━━╮
+│
+│ 📝 Digite o nome da música ou
+│    um link do YouTube
+│
+│ � *Exemplos:*
+│ ${prefix + command} Back to Black
+│ ${prefix + command} https://youtube.com/...
+│
+╰━━━━━━━━━━━━━━━━━━━━━━━━━╯`);
           }
 
           // Verificar se tem API key
@@ -9418,7 +11021,7 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
       case 'nome-bot':
         try {
           if (!isOwner) return reply("Este comando é exclusivo para o meu dono!");
-          if (!q) return reply(`Por favor, digite o novo nome do bot.\nExemplo: ${prefix}${command} Nazuna`);
+          if (!q) return reply(`Por favor, digite o novo nome do bot.\nExemplo: ${prefix}${command} LEOMODZ`);
           let config = JSON.parse(fs.readFileSync(CONFIG_FILE));
           config.nomebot = q;
           writeJsonFile(CONFIG_FILE, config);
@@ -9845,6 +11448,337 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
           await reply('😔 Ops, algo deu errado. Tente novamente mais tarde!');
         }
         break;
+      
+      // ============= SISTEMA DE COMANDOS VIP =============
+      case 'menuvip':
+      case 'vip':
+      case 'vipmenu':
+        try {
+          await sendMenuWithMedia('vip', async () => {
+            const customDesign = getMenuDesignWithDefaults(nomebot, pushname);
+            return await menuVIP.menuVIP(prefix, nomebot, pushname, customDesign);
+          });
+        } catch (error) {
+          console.error('Erro ao enviar menu VIP:', error);
+          await reply(`❌ Erro ao carregar menu VIP. Use ${prefix}infovip para mais informações.`);
+        }
+        break;
+
+      case 'infovip':
+      case 'vipinfo':
+        try {
+          const customDesign = getMenuDesignWithDefaults(nomebot, pushname);
+          const infoText = await menuVIP.menuVIPInfo(prefix, nomebot, pushname, customDesign);
+          await reply(infoText);
+        } catch (error) {
+          console.error('Erro ao enviar info VIP:', error);
+          await reply('❌ Erro ao carregar informações VIP.');
+        }
+        break;
+
+      case 'addcmdvip':
+      case 'addvipcommand':
+      case 'adicionarcmdvip':
+        try {
+          if (!isOwner) return reply('🚫 Este comando é apenas para o dono do bot!');
+          
+          if (!q) {
+            return reply(`📝 *Como adicionar comandos VIP:*
+
+*Formato:*
+${prefix}addcmdvip <comando> | <descrição> | <categoria>
+
+*Categorias disponíveis:*
+• download - Downloads
+• diversao - Diversão/Jogos
+• utilidade - Utilidades
+• ia - Inteligência Artificial
+• editor - Editores
+• info - Informação
+• outros - Outros
+
+*Exemplo:*
+${prefix}addcmdvip premium_ia | IA avançada exclusiva | ia
+
+*Opcional - com exemplo de uso:*
+${prefix}addcmdvip premium_ia | IA avançada exclusiva | ia | premium_ia <pergunta>`);
+          }
+          
+          const parts = q.split('|').map(p => p.trim());
+          
+          if (parts.length < 2) {
+            return reply('❌ Formato inválido! Use:\n' + prefix + 'addcmdvip <comando> | <descrição> | <categoria>');
+          }
+          
+          const cmdName = parts[0];
+          const cmdDesc = parts[1];
+          const cmdCategory = parts[2] || 'outros';
+          const cmdUsage = parts[3] || '';
+          
+          const result = vipCommandsManager.addVipCommand(cmdName, cmdDesc, cmdCategory, cmdUsage);
+          
+          await reply(result.message);
+          
+          if (result.success) {
+            console.log(`[VIP CMD] Comando "${cmdName}" adicionado por ${pushname} (${sender})`);
+          }
+        } catch (error) {
+          console.error('Erro ao adicionar comando VIP:', error);
+          await reply('❌ Erro ao adicionar comando VIP.');
+        }
+        break;
+
+      case 'removecmdvip':
+      case 'removevipcommand':
+      case 'rmcmdvip':
+      case 'delcmdvip':
+        try {
+          if (!isOwner) return reply('🚫 Este comando é apenas para o dono do bot!');
+          
+          if (!q) {
+            return reply(`📝 *Como remover comandos VIP:*
+
+*Formato:*
+${prefix}removecmdvip <comando>
+
+*Exemplo:*
+${prefix}removecmdvip premium_ia`);
+          }
+          
+          const cmdName = q.trim();
+          const result = vipCommandsManager.removeVipCommand(cmdName);
+          
+          await reply(result.message);
+          
+          if (result.success) {
+            console.log(`[VIP CMD] Comando "${cmdName}" removido por ${pushname} (${sender})`);
+          }
+        } catch (error) {
+          console.error('Erro ao remover comando VIP:', error);
+          await reply('❌ Erro ao remover comando VIP.');
+        }
+        break;
+
+      case 'listcmdvip':
+      case 'listvipcommands':
+      case 'comandosvip':
+        try {
+          if (!isOwner && !isPremium) {
+            return reply('🚫 Este comando é apenas para o dono ou usuários VIP!');
+          }
+          
+          const customDesign = getMenuDesignWithDefaults(nomebot, pushname);
+          const listText = await menuVIP.listVIPCommands(prefix, nomebot, pushname, customDesign);
+          
+          await reply(listText);
+        } catch (error) {
+          console.error('Erro ao listar comandos VIP:', error);
+          await reply('❌ Erro ao listar comandos VIP.');
+        }
+        break;
+
+      case 'togglecmdvip':
+      case 'ativarcmdvip':
+      case 'desativarcmdvip':
+        try {
+          if (!isOwner) return reply('🚫 Este comando é apenas para o dono do bot!');
+          
+          if (!args[0] || !args[1]) {
+            return reply(`📝 *Como ativar/desativar comandos VIP:*
+
+*Formato:*
+${prefix}togglecmdvip <comando> <on/off>
+
+*Exemplo:*
+${prefix}togglecmdvip premium_ia on
+${prefix}togglecmdvip premium_ia off`);
+          }
+          
+          const cmdName = args[0].trim();
+          const action = args[1].toLowerCase();
+          
+          if (!['on', 'off', 'ativar', 'desativar'].includes(action)) {
+            return reply('❌ Use "on" para ativar ou "off" para desativar!');
+          }
+          
+          const enabled = ['on', 'ativar'].includes(action);
+          const result = vipCommandsManager.toggleVipCommand(cmdName, enabled);
+          
+          await reply(result.message);
+          
+          if (result.success) {
+            console.log(`[VIP CMD] Comando "${cmdName}" ${enabled ? 'ativado' : 'desativado'} por ${pushname} (${sender})`);
+          }
+        } catch (error) {
+          console.error('Erro ao alternar comando VIP:', error);
+          await reply('❌ Erro ao alternar status do comando VIP.');
+        }
+        break;
+
+      case 'statsvip':
+      case 'vipstats':
+      case 'estatisticasvip':
+        try {
+          if (!isOwner) return reply('🚫 Este comando é apenas para o dono do bot!');
+          
+          const stats = vipCommandsManager.getVipStats();
+          
+          let statsText = `📊 *ESTATÍSTICAS DO SISTEMA VIP*\n\n`;
+          statsText += `╭─────────────────╮\n`;
+          statsText += `│ 📈 *RESUMO GERAL*\n`;
+          statsText += `╰─────────────────╯\n\n`;
+          statsText += `• Total de comandos: ${stats.total}\n`;
+          statsText += `• Comandos ativos: ${stats.active}\n`;
+          statsText += `• Comandos inativos: ${stats.inactive}\n`;
+          statsText += `• Total de categorias: ${stats.categories}\n\n`;
+          
+          if (stats.byCategory && stats.byCategory.length > 0) {
+            statsText += `╭─────────────────╮\n`;
+            statsText += `│ 📂 *POR CATEGORIA*\n`;
+            statsText += `╰─────────────────╯\n\n`;
+            
+            stats.byCategory.forEach(cat => {
+              statsText += `• ${cat.category}: ${cat.count}\n`;
+            });
+          }
+          
+          statsText += `\n━━━━━━━━━━━━━━━━\n\n`;
+          statsText += `💡 Use ${prefix}listcmdvip para ver todos os comandos`;
+          
+          await reply(statsText);
+        } catch (error) {
+          console.error('Erro ao obter estatísticas VIP:', error);
+          await reply('❌ Erro ao obter estatísticas VIP.');
+        }
+        break;
+      
+      // SISTEMA DE INDICAÇÕES
+      case 'addindicacao':
+      case 'addindicar':
+      case 'addindica':
+        try {
+          if (!isOwner) return reply("🚫 Este comando é apenas para o dono do bot!");
+          
+          if (!menc_os2) return reply("❌ Você precisa marcar alguém para adicionar uma indicação!\n\n💡 Exemplo: " + prefix + "addindicacao @usuario");
+          
+          const indicacoesFile = pathz.join(DATABASE_DIR, 'indicacoes.json');
+          let indicacoesData = loadJsonFile(indicacoesFile, { users: {} });
+          
+          if (!indicacoesData.users[menc_os2]) {
+            indicacoesData.users[menc_os2] = {
+              count: 0,
+              addedBy: [],
+              createdAt: new Date().toISOString()
+            };
+          }
+          
+          indicacoesData.users[menc_os2].count += 1;
+          indicacoesData.users[menc_os2].addedBy.push({
+            by: sender,
+            at: new Date().toISOString()
+          });
+          indicacoesData.users[menc_os2].lastUpdate = new Date().toISOString();
+          
+          writeJsonFile(indicacoesFile, indicacoesData);
+          
+          await nazu.sendMessage(from, {
+            text: `✅ *Indicação adicionada com sucesso!*\n\n👤 @${getUserName(menc_os2)} agora tem *${indicacoesData.users[menc_os2].count}* indicação(ões)! 🎉`,
+            mentions: [menc_os2]
+          }, { quoted: info });
+          
+        } catch (e) {
+          console.error('Erro no comando addindicacao:', e);
+          reply("❌ Ocorreu um erro ao adicionar a indicação.");
+        }
+        break;
+        
+      case 'topindica':
+      case 'topindicacao':
+      case 'rankindicacao':
+      case 'rankindicacoes':
+        try {
+          const indicacoesFile = pathz.join(DATABASE_DIR, 'indicacoes.json');
+          let indicacoesData = loadJsonFile(indicacoesFile, { users: {} });
+          
+          const usersArray = Object.entries(indicacoesData.users)
+            .map(([userId, data]) => ({ userId, count: data.count }))
+            .sort((a, b) => b.count - a.count);
+          
+          if (usersArray.length === 0) {
+            return reply("📊 Ainda não há indicações registradas no sistema.");
+          }
+          
+          let mensagem = '🏆 *TOP INDICAÇÕES DA BOT* 🏆\n\n';
+          mensagem += '═══════════════════\n\n';
+          
+          const topEmojis = ['🥇', '🥈', '🥉'];
+          const maxShow = Math.min(usersArray.length, 10);
+          
+          for (let i = 0; i < maxShow; i++) {
+            const emoji = i < 3 ? topEmojis[i] : `${i + 1}.`;
+            const user = usersArray[i];
+            mensagem += `${emoji} @${getUserName(user.userId)}\n`;
+            mensagem += `   └─ 📈 *${user.count}* indicação(ões)\n\n`;
+          }
+          
+          mensagem += '═══════════════════\n';
+          mensagem += `📊 Total de usuários: ${usersArray.length}\n`;
+          mensagem += `📊 Total de indicações: ${usersArray.reduce((sum, u) => sum + u.count, 0)}`;
+          
+          const mentions = usersArray.slice(0, maxShow).map(u => u.userId);
+          
+          await nazu.sendMessage(from, {
+            text: mensagem,
+            mentions: mentions
+          }, { quoted: info });
+          
+        } catch (e) {
+          console.error('Erro no comando topindica:', e);
+          reply("❌ Ocorreu um erro ao buscar o ranking de indicações.");
+        }
+        break;
+        
+      case 'delindicacao':
+      case 'rmindicacao':
+      case 'removerindicacao':
+        try {
+          if (!isOwner) return reply("🚫 Este comando é apenas para o dono do bot!");
+          
+          if (!menc_os2) return reply("❌ Você precisa marcar alguém para remover a indicação!\n\n💡 Exemplo: " + prefix + "delindicacao @usuario");
+          
+          const indicacoesFile = pathz.join(DATABASE_DIR, 'indicacoes.json');
+          let indicacoesData = loadJsonFile(indicacoesFile, { users: {} });
+          
+          if (!indicacoesData.users[menc_os2] || indicacoesData.users[menc_os2].count === 0) {
+            return reply("❌ Este usuário não possui indicações registradas!");
+          }
+          
+          const countBefore = indicacoesData.users[menc_os2].count;
+          
+          if (q && !isNaN(q)) {
+            const removeCount = parseInt(q);
+            indicacoesData.users[menc_os2].count = Math.max(0, indicacoesData.users[menc_os2].count - removeCount);
+          } else {
+            delete indicacoesData.users[menc_os2];
+          }
+          
+          writeJsonFile(indicacoesFile, indicacoesData);
+          
+          const finalMsg = q && !isNaN(q) 
+            ? `✅ Removidas *${Math.min(parseInt(q), countBefore)}* indicação(ões) de @${getUserName(menc_os2)}!\n\n📊 Total restante: *${indicacoesData.users[menc_os2]?.count || 0}*`
+            : `✅ Todas as indicações de @${getUserName(menc_os2)} foram removidas! (Total: *${countBefore}*)`;
+          
+          await nazu.sendMessage(from, {
+            text: finalMsg,
+            mentions: [menc_os2]
+          }, { quoted: info });
+          
+        } catch (e) {
+          console.error('Erro no comando delindicacao:', e);
+          reply("❌ Ocorreu um erro ao remover a indicação.");
+        }
+        break;
+      
       //COMANDOS GERAIS
       case 'rvisu':
       case 'open':
@@ -10674,8 +12608,8 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
           const subject = meta.subject || "—";
           const desc = meta.desc?.toString() || "Sem descrição";
           const createdAt = meta.creation ? new Date(meta.creation * 1000).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }) : "Desconhecida";
-          const ownerJid = meta.owner || meta.participants.find(p => p.admin && p.isCreator)?.lid || meta.participants.find(p => p.admin && p.isCreator)?.id || buildUserId("unknown");
-          const ownerTag = `@${getUserName(ownerJid)}`;
+          const ownerJid = meta.owner || meta.participants.find(p => p.admin && p.isCreator)?.lid || meta.participants.find(p => p.admin && p.isCreator)?.id || "Desconhecido";
+          const ownerTag = ownerJid !== "Desconhecido" ? `@${getUserName(ownerJid)}` : "Desconhecido";
           const totalMembers = meta.participants.length;
           const totalAdmins = groupAdmins.length;
           let totalMsgs = 0,
@@ -10771,45 +12705,7 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
           ].join('\n');
           const fullCaption = (lines + schedLines + '\n' + extrasLines).trim();
 
-          let groupPic = '';
-          try {
-            groupPic = await nazu.profilePictureUrl(from, 'image');
-          } catch {
-            groupPic = 'https://raw.githubusercontent.com/nazuninha/uploads/main/outros/1753966446765_oordgn.bin';
-          }
-          let bgImg = '';
-          try {
-            bgImg = '';
-          } catch {}
-          let statusBanner = null;
-          try {
-            statusBanner = await banner.StatusGrupo(
-              bgImg,
-              groupPic,
-              {
-                subject,
-                groupId: getUserName(from),
-                ownerTag,
-                createdAt,
-                desc,
-                totalMembers,
-                totalAdmins,
-                isPremium: !!premiumListaZinha[from],
-                rentStatus,
-                totalMsgs,
-                totalCmds,
-                totalFigs
-              }
-            );
-          } catch (e) {
-            console.error('Erro ao gerar banner StatusGrupo:', e);
-          }
-
-          if (statusBanner) {
-            await nazu.sendMessage(from, { image: statusBanner, caption: fullCaption, mentions: [ownerJid] }, { quoted: info });
-          } else {
-            await reply(fullCaption, { mentions: [ownerJid] });
-          }
+          await reply(fullCaption, { mentions: ownerJid !== "Desconhecido" ? [ownerJid] : [] });
         } catch (e) {
           console.error("Erro em statusgp:", e);
           await reply("❌ Ocorreu um erro interno. Tente novamente em alguns minutos.");
@@ -10817,7 +12713,13 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
         break;
       case 'dono':
         try {
-          const TextinDonoInfo = `╭⊰ 🌸 『 *INFORMAÇÕES DONO* 』\n┊\n┊👤 *Dono*: ${nomedono}\n┊📱 *Número Dono*: wa.me/${numerodono.replace(/\D/g, '')}\n┊\n╰─┈┈┈┈┈◜❁◞┈┈┈┈┈─╯`;
+          const numeroDonoFormatado = numerodono ? String(numerodono).replace(/\D/g, '') : 'Não configurado';
+          const TextinDonoInfo = `╭━━━⊱ 👑 *DONO DO BOT* 👑 ⊱━━━╮
+│
+│ 👤 *Nome:* ${nomedono}
+│ 📱 *Contato:* wa.me/${numeroDonoFormatado}
+│
+╰━━━━━━━━━━━━━━━━━━━━━━━━╯`;
           await reply(TextinDonoInfo);
         } catch (e) {
           console.error(e);
@@ -10827,7 +12729,14 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
 
       case 'criador':
         try {
-          const TextinCriadorInfo = `╭⊰ 🌸 『 *INFORMAÇÕES DO CRIADOR* 』\n┊\n┊👨‍💻 *Criador*: Hiudy\n┊📱 *Número*: wa.me/553399285117\n┊🌐 *GitHub*: github.com/hiudyy\n┊📸 *Instagram*: instagram.com/hiudyyy_\n┊\n╰─┈┈┈┈┈◜❁◞┈┈┈┈┈─╯`;
+          const TextinCriadorInfo = `╭━━━⊱ 👨‍💻 *CRIADOR* 👨‍💻 ⊱━━━╮
+│
+│ 💎 *Nome:* Hiudy
+│ 📱 *WhatsApp:* wa.me/553399285117
+│ 🌐 *GitHub:* github.com/hiudyy
+│ 📸 *Instagram:* instagram.com/hiudyyy_
+│
+╰━━━━━━━━━━━━━━━━━━━━━━━━╯`;
           await reply(TextinCriadorInfo);
         } catch (e) {
           console.error(e);
@@ -10855,16 +12764,16 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
             statusTexto = 'Ruim';
           }
           
-          const mensagem = `╭─「 ⚡ *STATUS* ⚡ 」
-┊
-┊ 📡 *Conexão*
-┊ ├─ ${statusEmoji} Latência: *${speedConverted.toFixed(3)}s*
-┊ └─ 📊 Status: *${statusTexto}*
-┊
-┊ ⏱️ *Tempo Online*
-┊ └─ 🟢 Uptime: *${uptimeBot}*
-┊
-╰─「 ${nomebot} 」`;
+          const mensagem = `╭━━━⊱ ⚡ *STATUS* ⚡ ⊱━━━╮
+│
+│ 📡 *Conexão*
+│ ├─ ${statusEmoji} Latência: *${speedConverted.toFixed(3)}s*
+│ └─ 📊 Status: *${statusTexto}*
+│
+│ ⏱️ *Tempo Online*
+│ └─ 🟢 Uptime: *${uptimeBot}*
+│
+╰━━━━━━━━━━━━━━━━━━━━━╯`;
           
           await reply(mensagem);
         } catch (e) {
@@ -10873,7 +12782,15 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
         }
         break;
       case 'toimg':
-        if (!isQuotedSticker) return reply('Por favor, *mencione um sticker* para executar o comando.');
+        if (!isQuotedSticker) return reply(`╭━━━⊱ 🖼️ *CONVERTER* 🖼️ ⊱━━━╮
+│
+│ ❌ Marque uma figurinha para
+│    converter em imagem!
+│
+│ 💡 Responda uma figurinha com:
+│ ${prefix}toimg
+│
+╰━━━━━━━━━━━━━━━━━━━━━━╯`);
         try {
           var buff;
           buff = await getFileBuffer(info.message.extendedTextMessage.contextInfo.quotedMessage.stickerMessage, 'sticker');
@@ -10970,9 +12887,32 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
           cores = cor[Math.floor(Math.random() * cor.length)];
           var fontes;
           fontes = fonte[Math.floor(Math.random() * fonte.length)];
+          
+          // Função para quebrar texto em linhas
+          function breakText(text, maxCharsPerLine = 20) {
+            const words = text.split(' ');
+            const lines = [];
+            let currentLine = '';
+            
+            for (const word of words) {
+              if ((currentLine + word).length <= maxCharsPerLine) {
+                currentLine += (currentLine ? ' ' : '') + word;
+              } else {
+                if (currentLine) lines.push(currentLine);
+                currentLine = word;
+              }
+            }
+            if (currentLine) lines.push(currentLine);
+            
+            return lines.join('%0A'); // %0A = quebra de linha na URL
+          }
+          
+          // Aplicar quebra de linha para textos longos
+          let processedText = q.length > 20 ? breakText(q, 20) : q;
+          
           await sendSticker(nazu, from, {
             sticker: {
-              url: `https://huratera.sirv.com/PicsArt_08-01-10.00.42.png?profile=Example-Text&text.0.text=${q}&text.0.outline.color=000000&text.0.outline.blur=0&text.0.outline.opacity=55&text.0.color=${cores}&text.0.font.family=${fontes}&text.0.background.color=ff0000`
+              url: `https://huratera.sirv.com/PicsArt_08-01-10.00.42.png?profile=Example-Text&text.0.text=${encodeURIComponent(processedText)}&text.0.outline.color=000000&text.0.outline.blur=0&text.0.outline.opacity=55&text.0.color=${cores}&text.0.font.family=${fontes}&text.0.font.weight=bold&text.0.background.color=ff0000`
             },
             author: `『${pushname}』\n『${nomebot}』\n『${nomedono}』\n『cognima.com.br』`,
             packname: '👤 Usuario(a)ᮀ۟❁’￫\n🤖 Botᮀ۟❁’￫\n👑 Donoᮀ۟❁’￫\n🌐 Siteᮀ۟❁’￫',
@@ -10983,6 +12923,111 @@ Exemplo: ${prefix}tradutor espanhol | Olá mundo! ✨`);
         } catch (e) {
           console.error(e);
           await reply("❌ Ocorreu um erro interno. Tente novamente em alguns minutos.");
+        }
+        break;
+      case 'attp':
+        try {
+          if (!q) return reply('Cadê o texto?');
+          
+          const fs = require('fs');
+          const path = require('path');
+          const axios = require('axios');
+          const { exec } = require('child_process');
+          const { promisify } = require('util');
+          const execAsync = promisify(exec);
+          
+          // Função para quebrar texto em linhas
+          function breakText(text, maxCharsPerLine = 20) {
+            const words = text.split(' ');
+            const lines = [];
+            let currentLine = '';
+            
+            for (const word of words) {
+              if ((currentLine + word).length <= maxCharsPerLine) {
+                currentLine += (currentLine ? ' ' : '') + word;
+              } else {
+                if (currentLine) lines.push(currentLine);
+                currentLine = word;
+              }
+            }
+            if (currentLine) lines.push(currentLine);
+            
+            return lines.join('%0A');
+          }
+          
+          // Processar texto
+          let processedText = q.length > 20 ? breakText(q, 20) : q;
+          
+          // Cores disponíveis
+          const cores = ["f702ff", "ff0202", "00ff2e", "efff00", "00ecff", "3100ff", "ffb400", "ff00b0", "00ff95", "9d00ff", "ff6b00", "00fff7", "ff00d4", "a8ff00", "ff0062", "00b3ff", "d4ff00", "ff009d"];
+          
+          // Selecionar uma fonte aleatória
+          const fontes = ["Days%20One", "Domine", "Exo", "Fredoka%20One", "Gentium%20Basic", "Gloria%20Hallelujah", "Great%20Vibes", "Orbitron", "PT%20Serif", "Pacifico"];
+          const fonteEscolhida = fontes[Math.floor(Math.random() * fontes.length)];
+          
+          // Diretório temporário
+          const tempDir = path.join(__dirname, '../midias/temp_attp_' + Date.now());
+          if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
+          }
+          
+          await reply('⏳ Gerando sticker animado... aguarde!');
+          
+          // Baixar 18 imagens com cores diferentes
+          const numFrames = 18;
+          const downloadPromises = [];
+          
+          for (let i = 0; i < numFrames; i++) {
+            const cor = cores[i % cores.length];
+            const imageUrl = `https://huratera.sirv.com/PicsArt_08-01-10.00.42.png?profile=Example-Text&text.0.text=${encodeURIComponent(processedText)}&text.0.outline.color=000000&text.0.outline.blur=0&text.0.outline.opacity=55&text.0.color=${cor}&text.0.font.family=${fonteEscolhida}&text.0.font.weight=bold&text.0.background.color=ff0000`;
+            const imagePath = path.join(tempDir, `frame_${String(i).padStart(3, '0')}.png`);
+            
+            downloadPromises.push(
+              axios({
+                url: imageUrl,
+                method: 'GET',
+                responseType: 'arraybuffer'
+              }).then(response => {
+                fs.writeFileSync(imagePath, response.data);
+              })
+            );
+          }
+          
+          // Aguardar download de todas as imagens
+          await Promise.all(downloadPromises);
+          
+          // Criar vídeo com ffmpeg
+          const outputVideo = path.join(tempDir, 'output.mp4');
+          const ffmpegCmd = `ffmpeg -framerate 10 -i ${path.join(tempDir, 'frame_%03d.png')} -vf "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=white" -c:v libx264 -pix_fmt yuv420p -t 2 ${outputVideo}`;
+          
+          await execAsync(ffmpegCmd);
+          
+          // Converter para webp animado
+          const outputWebp = path.join(tempDir, 'output.webp');
+          const webpCmd = `ffmpeg -i ${outputVideo} -vcodec libwebp -filter:v fps=fps=15 -lossless 0 -compression_level 6 -q:v 50 -loop 0 -preset picture -an -vsync 0 ${outputWebp}`;
+          
+          await execAsync(webpCmd);
+          
+          // Enviar sticker
+          await sendSticker(nazu, from, {
+            sticker: fs.readFileSync(outputWebp),
+            author: `『${pushname}』\n『${nomebot}』\n『${nomedono}』\n『cognima.com.br』`,
+            packname: `👤 Usuario(a)ᮀ۟❁'￫\n🤖 Botᮀ۟❁'￫\n👑 Donoᮀ۟❁'￫\n🌐 Siteᮀ۟❁'￫`,
+            type: 'image'
+          }, {
+            quoted: info
+          });
+          
+          // Limpar arquivos temporários
+          try {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+          } catch (cleanupError) {
+            console.error('Erro ao limpar arquivos temporários:', cleanupError);
+          }
+          
+        } catch (e) {
+          console.error(e);
+          await reply("❌ Ocorreu um erro ao criar o sticker animado. Tente novamente em alguns minutos.");
         }
         break;
       case 'brat':
@@ -11911,11 +13956,7 @@ A mensagem será enviada todos os dias às ${normalizedTime} (horário de São P
             
             mensagem += `  🥊 Partida ${i + 1}: ${p1} vs ${p2}\n`;
           });
-          const imageA = await banner.Chaveamento("", grupo1, grupo2);
-          await nazu.sendMessage(from, {
-            image: imageA,
-            caption: mensagem
-          });
+          await reply(mensagem);
         } catch (e) {
           console.error('Erro no comando chaveamento:', e);
           await reply("❌ Ocorreu um erro interno. Tente novamente em alguns minutos.");
@@ -13393,7 +15434,14 @@ ${tempo.includes('nunca') ? '😂 Brincadeira! Nunca desista dos seus sonhos!' :
         }
         const requestResult = relationshipManager.createRequest('brincadeira', from, sender, menc_os2);
         if (!requestResult.success) {
-          await reply(requestResult.message);
+          if (requestResult.mentions && requestResult.mentions.length > 0) {
+            await nazu.sendMessage(from, {
+              text: requestResult.message,
+              mentions: requestResult.mentions
+            }, { quoted: info });
+          } else {
+            await reply(requestResult.message);
+          }
           break;
         }
         await nazu.sendMessage(from, {
@@ -13402,7 +15450,8 @@ ${tempo.includes('nunca') ? '😂 Brincadeira! Nunca desista dos seus sonhos!' :
         });
         break;
       }
-      case 'namoro': {
+      case 'namoro':
+      case 'namorar': {
         if (!isGroup) {
           await reply('⚠️ Esse pedido só pode ser feito em grupos.');
           break;
@@ -13421,7 +15470,14 @@ ${tempo.includes('nunca') ? '😂 Brincadeira! Nunca desista dos seus sonhos!' :
         }
         const requestResult = relationshipManager.createRequest('namoro', from, sender, menc_os2);
         if (!requestResult.success) {
-          await reply(requestResult.message);
+          if (requestResult.mentions && requestResult.mentions.length > 0) {
+            await nazu.sendMessage(from, {
+              text: requestResult.message,
+              mentions: requestResult.mentions
+            }, { quoted: info });
+          } else {
+            await reply(requestResult.message);
+          }
           break;
         }
         await nazu.sendMessage(from, {
@@ -13450,7 +15506,14 @@ ${tempo.includes('nunca') ? '😂 Brincadeira! Nunca desista dos seus sonhos!' :
         }
         const requestResult = relationshipManager.createRequest('casamento', from, sender, menc_os2);
         if (!requestResult.success) {
-          await reply(requestResult.message);
+          if (requestResult.mentions && requestResult.mentions.length > 0) {
+            await nazu.sendMessage(from, {
+              text: requestResult.message,
+              mentions: requestResult.mentions
+            }, { quoted: info });
+          } else {
+            await reply(requestResult.message);
+          }
           break;
         }
         await nazu.sendMessage(from, {
@@ -13491,9 +15554,10 @@ ${tempo.includes('nunca') ? '😂 Brincadeira! Nunca desista dos seus sonhos!' :
           break;
         }
 
-        await reply(summary.message, {
+        await nazu.sendMessage(from, {
+          text: summary.message,
           mentions: summary.mentions || [userOne, userTwo]
-        });
+        }, { quoted: info });
         break;
       }
       case 'terminar':
@@ -13552,9 +15616,94 @@ ${tempo.includes('nunca') ? '😂 Brincadeira! Nunca desista dos seus sonhos!' :
         });
         break;
       }
+
+      case 'trair':
+      case 'traicao': {
+        if (!isGroup) {
+          await reply('⚠️ Esse comando só pode ser usado em grupos.');
+          break;
+        }
+        if (!isModoBn) {
+          await reply('❌ O modo brincadeira não está ativo nesse grupo.');
+          break;
+        }
+
+        if (!menc_os2) {
+          await reply('❌ Você precisa marcar alguém para trair! Exemplo: ' + groupPrefix + 'trair @pessoa');
+          break;
+        }
+
+        if (menc_os2 === sender) {
+          await reply('❌ Você não pode trair a si mesmo... isso não faz sentido! 🤨');
+          break;
+        }
+
+        // Cria pedido de traição (precisa ser aceito pelo alvo)
+        const betrayalResult = relationshipManager.createBetrayalRequest(sender, menc_os2, from, groupPrefix);
+        if (!betrayalResult.success) {
+          await reply(betrayalResult.message, { mentions: betrayalResult.mentions || [] });
+          break;
+        }
+
+        await nazu.sendMessage(from, {
+          text: betrayalResult.message,
+          mentions: betrayalResult.mentions || [sender, menc_os2]
+        });
+        break;
+      }
+
+      case 'historicotraicao':
+      case 'historicotraicoes':
+      case 'historicodetraicao': {
+        if (!isGroup) {
+          await reply('⚠️ Esse comando só pode ser usado em grupos.');
+          break;
+        }
+        if (!isModoBn) {
+          await reply('❌ O modo brincadeira não está ativo nesse grupo.');
+          break;
+        }
+
+        const mentionedList = Array.isArray(menc_jid2) ? menc_jid2 : [];
+        let userOne = null;
+        let userTwo = null;
+
+        if (mentionedList.length >= 2) {
+          [userOne, userTwo] = mentionedList;
+        } else if (menc_os2) {
+          userOne = sender;
+          userTwo = menc_os2;
+        } else {
+          const activePair = relationshipManager.getActivePairForUser(sender);
+          if (!activePair) {
+            await reply('❌ Você não marcou ninguém e não possui relacionamento ativo para consultar o histórico.');
+            break;
+          }
+          userOne = sender;
+          userTwo = activePair.partnerId;
+        }
+
+        if (userOne === userTwo) {
+          await reply('❌ Selecione pessoas diferentes para consultar o histórico.');
+          break;
+        }
+
+        const historyResult = relationshipManager.getBetrayalHistory(userOne, userTwo);
+        if (!historyResult.success) {
+          await reply(historyResult.message);
+          break;
+        }
+
+        await nazu.sendMessage(from, {
+          text: historyResult.message,
+          mentions: historyResult.mentions || [userOne, userTwo]
+        });
+        break;
+      }
+
       case 'casal':
         try {
-          if (!isGroup) return reply("Isso só pode ser usado em grupo 💔");
+          if (!isGroup) return reply("╭━━━⊱ 💔 *ERRO* 💔 ⊱━━━╮\n│\n│ ❌ Este comando só funciona\n│    em grupos!\n│\n╰━━━━━━━━━━━━━━━━━━━━╯");
           if (!isModoBn) return reply('❌ O modo brincadeira não está ativo nesse grupo.');
           if (AllgroupMembers.length < 2) return reply('❌ Preciso de pelo menos 2 membros no grupo!');
           let path = buildGroupFilePath(from);
@@ -13578,7 +15727,22 @@ ${tempo.includes('nunca') ? '😂 Brincadeira! Nunca desista dos seus sonhos!' :
                            shipLevel >= 60 ? '😍 Ship promissor!' : 
                            shipLevel >= 40 ? '😊 Rolou uma química!' : 
                            shipLevel >= 20 ? '🤔 Meio forçado...' : '😅 Só na amizade!';
-          await reply(`💘 *${comentario}* 💘\n\n👑 **CASAL DO MOMENTO** �\n@${getUserName(membro1)} ❤️ @${getUserName(membro2)}\n\n� **Nível de ship:** *${shipLevel}%*\n🎯 **Chance de dar certo:** *${chance}%*\n\n${statusShip}\n\n${chance >= 70 ? '🎉 Já podem marcar o casamento!' : chance >= 50 ? '👀 Vale a pena investir!' : '😂 Melhor ficar só na amizade!'}`, {
+          await reply(`╭━━━⊱ 💘 *CASAL* 💘 ⊱━━━╮
+│
+│ 💫 *${comentario}*
+│
+│ 👑 *CASAL DO MOMENTO*
+│ @${getUserName(membro1)} ❤️ @${getUserName(membro2)}
+│
+│ 📊 *Estatísticas*
+│ └─ 💖 Ship: *${shipLevel}%*
+│ └─ 🎯 Chance: *${chance}%*
+│
+│ ${statusShip}
+│
+│ ${chance >= 70 ? '🎉 Já podem marcar o casamento!' : chance >= 50 ? '👀 Vale a pena investir!' : '😂 Melhor ficar só na amizade!'}
+│
+╰━━━━━━━━━━━━━━━━━━━━━━╯`, {
             mentions: [membro1, membro2]
           });
         } catch (e) {
@@ -13588,9 +15752,17 @@ ${tempo.includes('nunca') ? '😂 Brincadeira! Nunca desista dos seus sonhos!' :
         break;
       case 'shipo':
         try {
-          if (!isGroup) return reply("Isso só pode ser usado em grupo 💔");
+          if (!isGroup) return reply("╭━━━⊱ 💔 *ERRO* 💔 ⊱━━━╮\n│\n│ ❌ Este comando só funciona\n│    em grupos!\n│\n╰━━━━━━━━━━━━━━━━━━━━╯");
           if (!isModoBn) return reply('❌ O modo brincadeira não está ativo nesse grupo.');
-          if (!menc_os2) return reply('Marque alguém para eu encontrar um par! Exemplo: ' + prefix + 'shipo @fulano');
+          if (!menc_os2) return reply(`╭━━━⊱ 💘 *SHIPO* 💘 ⊱━━━╮
+│
+│ ❌ Marque alguém para
+│    encontrar um par!
+│
+│ 💡 *Exemplo:*
+│ ${prefix}shipo @fulano
+│
+╰━━━━━━━━━━━━━━━━━━━━╯`);
           if (AllgroupMembers.length < 2) return reply('❌ Preciso de pelo menos 2 membros no grupo!');
           let path = buildGroupFilePath(from);
           let data = fs.existsSync(path) ? JSON.parse(fs.readFileSync(path)) : {
@@ -13615,7 +15787,24 @@ ${tempo.includes('nunca') ? '😂 Brincadeira! Nunca desista dos seus sonhos!' :
                            shipLevel >= 70 ? '🎆 Ship de qualidade!' : 
                            shipLevel >= 50 ? '😊 Tem potencial!' : 
                            shipLevel >= 30 ? '🤔 Pode rolar...' : '😅 Força demais!';
-          await reply(`${emoji} *${comentario}* ${emoji}\n\n👑 **SHIP SELECIONADO** �\n@${getUserName(menc_os2)} ✨ @${getUserName(par)}\n\n💫 **Ship name:** *${nomeShip}*\n� **Nível de ship:** *${shipLevel}%*\n🎯 **Compatibilidade:** *${chance}%*\n\n${statusShip}\n\n${chance >= 75 ? '🎉 Relacionamento dos sonhos!' : chance >= 50 ? '👀 Merece uma chance!' : '😂 Melhor só shippar mesmo!'}`, {
+          await reply(`╭━━━⊱ ${emoji} *SHIPO* ${emoji} ⊱━━━╮
+│
+│ 💫 *${comentario}*
+│
+│ 👑 *SHIP SELECIONADO*
+│ @${getUserName(menc_os2)} ✨ @${getUserName(par)}
+│
+│ 💫 *Ship name:* ${nomeShip}
+│
+│ 📊 *Estatísticas*
+│ └─ 💖 Ship: *${shipLevel}%*
+│ └─ 🎯 Compatibilidade: *${chance}%*
+│
+│ ${statusShip}
+│
+│ ${chance >= 75 ? '🎉 Relacionamento dos sonhos!' : chance >= 50 ? '👀 Merece uma chance!' : '😂 Melhor só shippar mesmo!'}
+│
+╰━━━━━━━━━━━━━━━━━━━━━━━╯`, {
             mentions: [menc_os2, par]
           });
         } catch (e) {
@@ -14740,6 +16929,135 @@ ${groupData.rules.length}. ${q}`);
         }
         break;
       
+      case 'wl.add':
+      case 'wladd':
+      case 'addwhitelist':
+        try {
+          if (!isGroup) return reply("Este comando só funciona em grupos.");
+          if (!isGroupAdmin) return reply("Apenas administradores podem adicionar usuários à whitelist.");
+          
+          if (!menc_os2) {
+            const availableAntis = ['antilink', 'antilinkgp', 'antilinkhard', 'antiporn', 'antistatus', 'antibtn', 'antidoc', 'antiloc', 'antifig'];
+            return reply(`📋 *Uso do comando:*
+${prefix}wl.add @usuario | anti1,anti2,anti3
+
+*Antis disponíveis:*
+${availableAntis.map(a => `• ${a}`).join('\n')}
+
+*Exemplo:*
+${prefix}wl.add @usuario | antilink,antistatus,antiporn`);
+          }
+          
+          const userId = menc_os2;
+          
+          const wlArgs = q.split('|').map(a => a.trim());
+          const antisString = wlArgs.length > 1 ? wlArgs[1] : wlArgs[0];
+          
+          if (!antisString || antisString.length === 0) {
+            return reply(`⚠️ Especifique os antis após o |
+
+*Exemplo:*
+${prefix}wl.add @usuario | antilink,antistatus`);
+          }
+          
+          const antis = antisString.split(',').map(a => a.trim().toLowerCase()).filter(a => a.length > 0 && !a.includes('@'));
+          
+          if (antis.length === 0) {
+            return reply('⚠️ Nenhum anti válido foi especificado. Use o formato: antilink,antistatus,antiporn');
+          }
+          
+          const validAntis = ['antilink', 'antilinkgp', 'antilinkhard', 'antiporn', 'antistatus', 'antibtn', 'antidoc', 'antiloc', 'antifig'];
+          const invalidAntis = antis.filter(a => !validAntis.includes(a));
+          
+          if (invalidAntis.length > 0) {
+            return reply(`❌ Antis inválidos: ${invalidAntis.join(', ')}\n\n*Válidos:* ${validAntis.join(', ')}`);
+          }
+          
+          groupData.adminWhitelist[userId] = {
+            antis: antis,
+            addedBy: sender,
+            addedAt: new Date().toISOString()
+          };
+          
+          persistGroupData();
+          
+          await reply(`✅ @${getUserName(userId)} adicionado à whitelist!\n\n*Antis ignorados:*\n${antis.map(a => `• ${a}`).join('\n')}`, {
+            mentions: [userId]
+          });
+        } catch (e) {
+          console.error('Erro no comando wl.add:', e);
+          await reply("❌ Ocorreu um erro ao adicionar à whitelist.");
+        }
+        break;
+        
+      case 'wl.remove':
+      case 'wlremove':
+      case 'removewhitelist':
+        try {
+          if (!isGroup) return reply("Este comando só funciona em grupos.");
+          if (!isGroupAdmin) return reply("Apenas administradores podem remover usuários da whitelist.");
+          
+          if (!menc_os2) {
+            return reply(`⚠️ Marque o usuário que deseja remover da whitelist.\n\nEx: ${prefix}wl.remove @usuario`);
+          }
+          
+          const userId = menc_os2;
+          
+          if (!groupData.adminWhitelist[userId]) {
+            return reply(`@${getUserName(userId)} não está na whitelist.`, {
+              mentions: [userId]
+            });
+          }
+          
+          delete groupData.adminWhitelist[userId];
+          persistGroupData();
+          
+          await reply(`✅ @${getUserName(userId)} removido da whitelist!`, {
+            mentions: [userId]
+          });
+        } catch (e) {
+          console.error('Erro no comando wl.remove:', e);
+          await reply("❌ Ocorreu um erro ao remover da whitelist.");
+        }
+        break;
+        
+      case 'wl.lista':
+      case 'wllist':
+      case 'listawhitelist':
+      case 'whitelistlista':
+        try {
+          if (!isGroup) return reply("Este comando só funciona em grupos.");
+          
+          const whitelistEntries = Object.entries(groupData.adminWhitelist || {});
+          
+          if (whitelistEntries.length === 0) {
+            return reply('📋 Não há usuários na whitelist deste grupo.');
+          }
+          
+          let message = `📋 *Whitelist do Grupo*\n`;
+          message += `═══════════════════\n\n`;
+          
+          const mentions = [];
+          
+          whitelistEntries.forEach(([userId, data], index) => {
+            mentions.push(userId);
+            message += `${index + 1}. @${getUserName(userId)}\n`;
+            message += `   *Antis ignorados:*\n`;
+            data.antis.forEach(anti => {
+              message += `   • ${anti}\n`;
+            });
+            message += `   *Adicionado em:* ${new Date(data.addedAt).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}\n\n`;
+          });
+          
+          message += `═══════════════════\n`;
+          message += `Total: ${whitelistEntries.length} usuário(s)`;
+          
+          await reply(message, { mentions });
+        } catch (e) {
+          console.error('Erro no comando wl.lista:', e);
+          await reply("❌ Ocorreu um erro ao listar whitelist.");
+        }
+        break;
         
         case 'minmessage':
   try {
@@ -14877,6 +17195,25 @@ ${groupData.rules.length}. ${q}`);
   }
   break;
   
+  case 'msgboton':
+  try {
+    if (!isOwner) return reply('🚫 Apenas o dono pode alterar esta configuração!');
+    
+    const currentConfig = loadMsgBotOn();
+    const newStatus = !currentConfig.enabled;
+    
+    if (saveMsgBotOn(newStatus)) {
+      const statusText = newStatus ? '✅ ativada' : '❌ desativada';
+      await reply(`🔔 *Mensagem de inicialização ${statusText}!*\n\nAgora, quando o bot ligar, ${newStatus ? 'você receberá' : 'NÃO receberá'} uma mensagem de boas-vindas no seu privado.`);
+    } else {
+      await reply('❌ Erro ao salvar configuração.');
+    }
+  } catch (e) {
+    console.error('Erro no msgboton:', e);
+    await reply('❌ Ocorreu um erro ao processar sua solicitação.');
+  }
+  break;
+  
   case 'addreact':
   try {
     if (!isOwner) return reply('Apenas o dono pode adicionar reacts.');
@@ -14933,6 +17270,57 @@ ${groupData.rules.length}. ${q}`);
   } catch (e) {
     await reply('❌ Ocorreu um erro inesperado 😢');
     console.error(e);
+  }
+  break;
+  
+  case 'cachedebug':
+  case 'debugcache':
+  try {
+    if (!isOwnerOrSub) return reply('🚫 Apenas o dono e subdonos podem usar este comando.');
+    
+    const { saveJidLidCache } = require('./utils/helpers');
+    const cacheFilePath = JID_LID_CACHE_FILE;
+    
+    // Força salvar o cache atual
+    saveJidLidCache();
+    
+    // Lê o arquivo de cache
+    let cacheData = { mappings: {}, version: 'N/A', lastUpdate: 'N/A' };
+    try {
+      if (fs.existsSync(cacheFilePath)) {
+        cacheData = JSON.parse(fs.readFileSync(cacheFilePath, 'utf-8'));
+      }
+    } catch (e) {
+      console.error('Erro ao ler cache:', e);
+    }
+    
+    const mappings = cacheData.mappings || {};
+    const entries = Object.entries(mappings);
+    const totalEntries = entries.length;
+    
+    let msg = '📊 *Cache JID→LID Debug*\n\n';
+    msg += `📈 Total de entradas: ${totalEntries}\n`;
+    msg += `🕐 Última atualização: ${cacheData.lastUpdate || 'N/A'}\n`;
+    msg += `📦 Versão: ${cacheData.version || 'N/A'}\n\n`;
+    
+    if (totalEntries > 0) {
+      msg += '📋 *Últimas 10 entradas:*\n\n';
+      const lastTen = entries.slice(-10);
+      lastTen.forEach(([jid, lid], idx) => {
+        const jidShort = jid.substring(0, 15) + '...';
+        const lidShort = lid.substring(0, 20) + '...';
+        msg += `${idx + 1}. JID: ${jidShort}\n   LID: ${lidShort}\n\n`;
+      });
+    } else {
+      msg += '⚠️ Cache vazio - nenhuma conversão JID→LID registrada ainda.\n';
+    }
+    
+    msg += `\n💾 Arquivo: ${cacheFilePath.split('/').slice(-2).join('/')}`;
+    
+    await reply(msg);
+  } catch (e) {
+    console.error('Erro no cachedebug:', e);
+    await reply('❌ Ocorreu um erro ao acessar o cache.');
   }
   break;
 
@@ -15299,8 +17687,9 @@ ${groupData.rules.length}. ${q}`);
           await processAutoResponse(nazu, from, body, info);
         };
     };
+    
   } catch (error) {
-    console.error('==== ERRO NO PROCESSAMENTO DA MENSAGEM ====');
+    console.error(`❌ [${msgId}] ERRO NO PROCESSAMENTO DA MENSAGEM`);
     console.error('Tipo de erro:', error.name);
     console.error('Mensagem:', error.message);
     console.error('Stack trace:', error.stack);
