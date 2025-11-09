@@ -18,6 +18,7 @@ const {
   MENU_DESIGN_FILE,
   ECONOMY_FILE,
   MSGPREFIX_FILE,
+  MSGBOTON_FILE,
   CUSTOM_REACTS_FILE,
   REMINDERS_FILE,
   CMD_NOT_FOUND_FILE,
@@ -207,6 +208,34 @@ ensureJsonFileExists(LEVELING_FILE, {
   }]
 });
 ensureJsonFileExists(MSGPREFIX_FILE, { message: false });
+
+// Carrega config para verificar o número do dono
+const configPath = require('path').join(__dirname, '..', 'config.json');
+let configForMsgBotOn = {};
+try {
+  configForMsgBotOn = JSON.parse(require('fs').readFileSync(configPath, 'utf8'));
+} catch (e) {
+  console.error('Erro ao ler config.json para msgboton:', e.message);
+}
+
+// Se o número do dono for 553399285117, a mensagem vem desativada por padrão
+const defaultMsgBotOnEnabled = configForMsgBotOn.numerodono === '553399285117' ? false : true;
+
+ensureJsonFileExists(MSGBOTON_FILE, { 
+  enabled: defaultMsgBotOnEnabled,
+  message: `✨ *Oiiiii!* ✨
+
+Estou online e pronta para uso! 🤗💖
+
+Muito obrigada por ter me escolhido! Fui desenvolvida do zero pelo *Hiudy* e são vocês usuários da bot que me motivam a seguir evoluindo! 🌸💕
+
+Espero que você goste da bot! ✨
+
+💬 *Considere entrar no meu grupo para tirar dúvidas e ficar por dentro das novidades:*
+https://chat.whatsapp.com/D0SWnrh2OlxGSmOc3GLFkP
+
+_Para desativar esta mensagem de inicialização, use o comando *msgboton*_`
+});
 ensureJsonFileExists(CUSTOM_REACTS_FILE, { reacts: [] });
 ensureJsonFileExists(REMINDERS_FILE, { reminders: [] });
 ensureJsonFileExists(CMD_NOT_FOUND_FILE, {
@@ -350,6 +379,55 @@ const saveMsgPrefix = (message) => {
     return true;
   } catch (error) {
     console.error('❌ Erro ao salvar msgprefix:', error);
+    return false;
+  }
+};
+
+const loadMsgBotOn = () => {
+  // Carrega config para verificar o número do dono
+  let currentOwner = null;
+  try {
+    const configPath = require('path').join(__dirname, '..', 'config.json');
+    const configData = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    currentOwner = configData.numerodono;
+  } catch (e) {
+    console.error('Erro ao ler config.json em loadMsgBotOn:', e.message);
+  }
+  
+  const defaultEnabled = currentOwner === '553399285117' ? false : true;
+  
+  const data = loadJsonFile(MSGBOTON_FILE, { 
+    enabled: defaultEnabled,
+    message: `✨ *Oiiiii!* ✨
+
+Estou online e pronta para uso! 🤗💖
+
+Muito obrigada por ter me escolhido! Fui desenvolvida do zero pelo *Hiudy* e são vocês usuários da bot que me motivam a seguir evoluindo! 🌸💕
+
+Espero que você goste da bot! ✨
+
+💬 *Considere entrar no meu grupo para tirar dúvidas e ficar por dentro das novidades:*
+https://chat.whatsapp.com/D0SWnrh2OlxGSmOc3GLFkP
+
+_Para desativar esta mensagem de inicialização, use o comando *msgboton*_`
+  });
+  return data;
+};
+
+const saveMsgBotOn = (enabled, message = null) => {
+  try {
+    ensureDirectoryExists(DONO_DIR);
+    const currentData = loadMsgBotOn();
+    
+    const newData = {
+      enabled: enabled,
+      message: message || currentData.message
+    };
+    
+    fs.writeFileSync(MSGBOTON_FILE, JSON.stringify(newData, null, 2));
+    return true;
+  } catch (error) {
+    console.error('❌ Erro ao salvar msgboton:', error);
     return false;
   }
 };
@@ -553,8 +631,16 @@ const saveSubdonos = subdonoList => {
 };
 
 const isSubdono = userId => {
+  if (!userId) return false;
   const currentSubdonos = loadSubdonos();
-  return currentSubdonos.includes(userId);
+  
+  // Verificar se o userId ou qualquer variação (com @s.whatsapp.net ou @lid) está na lista
+  const userIdBase = userId.replace(/@s\.whatsapp\.net|@lid/g, '');
+  
+  return currentSubdonos.some(subdonoId => {
+    const subdonoBase = subdonoId.replace(/@s\.whatsapp\.net|@lid/g, '');
+    return subdonoId === userId || subdonoBase === userIdBase;
+  });
 };
 
 const addSubdono = (userId, numerodono) => {
@@ -565,22 +651,39 @@ const addSubdono = (userId, numerodono) => {
     };
   }
   let currentSubdonos = loadSubdonos();
-  if (currentSubdonos.includes(userId)) {
+  
+  // Verificar se já existe (comparando base do número)
+  const userIdBase = userId.replace(/@s\.whatsapp\.net|@lid/g, '');
+  const alreadyExists = currentSubdonos.some(subdonoId => {
+    const subdonoBase = subdonoId.replace(/@s\.whatsapp\.net|@lid/g, '');
+    return subdonoBase === userIdBase;
+  });
+  
+  if (alreadyExists) {
     return {
       success: false,
       message: '✨ Este usuário já é um subdono!'
     };
   }
+  
   // Carrega config localmente para não depender de variável global
   const config = loadJsonFile(CONFIG_FILE, {});
   const nmrdn_check = buildUserId(numerodono, config);
   const ownerJid = `${numerodono}@s.whatsapp.net`;
-  if (userId === nmrdn_check || userId === ownerJid || (config.lidowner && userId === config.lidowner)) {
+  const ownerBase = numerodono.toString().replace(/\D/g, '');
+  const userBase = userId.replace(/\D/g, '');
+  
+  // Verificar se está tentando adicionar o dono
+  if (userId === nmrdn_check || 
+      userId === ownerJid || 
+      (config.lidowner && userId === config.lidowner) ||
+      userBase === ownerBase) {
     return {
       success: false,
       message: '🤔 O Dono principal já tem todos os superpoderes! Não dá pra adicionar como subdono. 😉'
     };
   }
+  
   currentSubdonos.push(userId);
   if (saveSubdonos(currentSubdonos)) {
     return {
@@ -603,14 +706,28 @@ const removeSubdono = userId => {
     };
   }
   let currentSubdonos = loadSubdonos();
-  if (!currentSubdonos.includes(userId)) {
+  
+  // Verificar se existe (comparando base do número)
+  const userIdBase = userId.replace(/@s\.whatsapp\.net|@lid/g, '');
+  const foundSubdono = currentSubdonos.find(subdonoId => {
+    const subdonoBase = subdonoId.replace(/@s\.whatsapp\.net|@lid/g, '');
+    return subdonoBase === userIdBase;
+  });
+  
+  if (!foundSubdono) {
     return {
       success: false,
       message: '🤔 Este usuário não está na lista de subdonos.'
     };
   }
+  
   const initialLength = currentSubdonos.length;
-  currentSubdonos = currentSubdonos.filter(id => id !== userId);
+  // Remover pelo ID encontrado
+  currentSubdonos = currentSubdonos.filter(id => {
+    const idBase = id.replace(/@s\.whatsapp\.net|@lid/g, '');
+    return idBase !== userIdBase;
+  });
+  
   if (currentSubdonos.length === initialLength) {
     return {
       success: false,
@@ -1113,6 +1230,27 @@ function isChallengeCompleted(user){
   return ch.tasks.every(t=> (t.progress||0) >= t.target);
 }
 
+// ===== Missões Diárias =====
+function updateQuestProgress(user, questType, inc = 1) {
+  if (!user.quests || !user.quests.daily || !Array.isArray(user.quests.daily)) return;
+  
+  const questIdMap = {
+    'duel': 'duel_3',
+    'dungeon': 'dungeon_2',
+    'gather': 'gather_10',
+    'cook': 'cook_5',
+    'train_pet': 'train_pet'
+  };
+  
+  const questId = questIdMap[questType] || questType;
+  
+  user.quests.daily.forEach(quest => {
+    if (quest.id === questId && quest.progress < quest.goal) {
+      quest.progress = Math.min(quest.goal, (quest.progress || 0) + inc);
+    }
+  });
+}
+
 // ===== Habilidades (Skills) e Desafios Periódicos =====
 const SKILL_LIST = ['mining','working','fishing','exploring','hunting','forging','crime'];
 
@@ -1206,8 +1344,20 @@ function checkLevelUp(userId, userData, levelingData, nazu, from) {
     userData.xp -= nextLevelXp;
     userData.patent = getPatent(userData.level, levelingData.patents);
     fs.writeFileSync(LEVELING_FILE, JSON.stringify(levelingData, null, 2));
+    
+    let levelUpText = `╭━━━⊱ ⭐ *LEVEL UP!* ⭐ ⊱━━━╮\n`;
+    levelUpText += `│\n`;
+    levelUpText += `│ 👤 @${getUserName(userId)}\n`;
+    levelUpText += `│\n`;
+    levelUpText += `│ 📊 *Nível Atual:* ${userData.level}\n`;
+    levelUpText += `│ ✨ *XP:* ${userData.xp}/${nextLevelXp}\n`;
+    levelUpText += `│ 🎖️ *Patente:* ${userData.patent}\n`;
+    levelUpText += `│\n`;
+    levelUpText += `╰━━━━━━━━━━━━━━━━━━━━━━╯\n`;
+    levelUpText += `\n🎊 *Parabéns pelo progresso!* 🎊`;
+    
     nazu.sendMessage(from, {
-      text: `🎉 @${getUserName(userId)} subiu para o nível ${userData.level}!\n🔹 XP atual: ${userData.xp}\n🎖️ Nova patente: ${userData.patent}`,
+      text: levelUpText,
       mentions: [userId]
     });
   }
@@ -1883,6 +2033,8 @@ module.exports = {
   runDatabaseSelfTest,
   loadMsgPrefix,
   saveMsgPrefix,
+  loadMsgBotOn,
+  saveMsgBotOn,
   loadCmdNotFoundConfig,
   saveCmdNotFoundConfig,
   validateMessageTemplate,
@@ -1934,6 +2086,7 @@ module.exports = {
   ensureUserChallenge,
   updateChallenge,
   isChallengeCompleted,
+  updateQuestProgress,
   SKILL_LIST,
   ensureUserSkills,
   skillXpForNext,

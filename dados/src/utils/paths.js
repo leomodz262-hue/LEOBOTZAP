@@ -2,7 +2,10 @@ const path = require('path');
 
 const SRC_DIR = path.join(__dirname, '..');
 const ROOT_DIR = path.join(SRC_DIR, '..');
-const DATABASE_DIR = path.join(ROOT_DIR, 'database');
+
+// Detecta se é sub-bot e ajusta os caminhos de database
+const BASE_DATABASE_DIR = process.env.DATABASE_PATH || path.join(ROOT_DIR, 'database');
+const DATABASE_DIR = BASE_DATABASE_DIR;
 const GRUPOS_DIR = path.join(DATABASE_DIR, 'grupos');
 const USERS_DIR = path.join(DATABASE_DIR, 'users');
 const DONO_DIR = path.join(DATABASE_DIR, 'dono');
@@ -18,6 +21,7 @@ const GLOBAL_BLACKLIST_FILE = path.join(DONO_DIR, 'globalBlacklist.json');
 const MENU_DESIGN_FILE = path.join(DONO_DIR, 'menuDesign.json');
 const ECONOMY_FILE = path.join(DATABASE_DIR, 'economy.json');
 const MSGPREFIX_FILE = path.join(DONO_DIR, 'msgprefix.json');
+const MSGBOTON_FILE = path.join(DONO_DIR, 'msgboton.json');
 const CUSTOM_REACTS_FILE = path.join(DATABASE_DIR, 'customReacts.json');
 const REMINDERS_FILE = path.join(DATABASE_DIR, 'reminders.json');
 const CMD_NOT_FOUND_FILE = path.join(DONO_DIR, 'cmdNotFound.json');
@@ -32,11 +36,15 @@ const BOT_STATE_FILE = path.join(DATABASE_DIR, 'botState.json');
 const AUTO_HORARIOS_FILE = path.join(DATABASE_DIR, 'autohorarios.json');
 const AUTO_MENSAGENS_FILE = path.join(DATABASE_DIR, 'automensagens.json');
 const MODO_LITE_FILE = path.join(DATABASE_DIR, 'modolite.json');
+const JID_LID_CACHE_FILE = path.join(DATABASE_DIR, 'jid_lid_cache.json');
 const SUBDONOS_FILE = path.join(DONO_DIR, 'subdonos.json');
 const ALUGUEIS_FILE = path.join(DONO_DIR, 'alugueis.json');
 const CODIGOS_ALUGUEL_FILE = path.join(DONO_DIR, 'codigos_aluguel.json');
 const RELATIONSHIPS_FILE = path.join(DATABASE_DIR, 'relationships.json');
-const CONFIG_FILE = path.join(SRC_DIR, 'config.json');
+
+// Detecta se é sub-bot e ajusta o caminho do config
+const CONFIG_FILE = process.env.CONFIG_PATH || path.join(SRC_DIR, 'config.json');
+
 const PACKAGE_JSON_PATH = path.join(ROOT_DIR, '..', 'package.json');
 
 module.exports = {
@@ -57,6 +65,7 @@ module.exports = {
   MENU_DESIGN_FILE,
   ECONOMY_FILE,
   MSGPREFIX_FILE,
+  MSGBOTON_FILE,
   CUSTOM_REACTS_FILE,
   REMINDERS_FILE,
   CMD_NOT_FOUND_FILE,
@@ -71,6 +80,7 @@ module.exports = {
   AUTO_HORARIOS_FILE,
   AUTO_MENSAGENS_FILE,
   MODO_LITE_FILE,
+  JID_LID_CACHE_FILE,
   SUBDONOS_FILE,
   ALUGUEIS_FILE,
   CODIGOS_ALUGUEL_FILE,
