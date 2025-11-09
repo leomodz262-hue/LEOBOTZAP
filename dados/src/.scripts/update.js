@@ -9,7 +9,7 @@ const os = require('os');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
 
-const REPO_URL = 'https://github.com/hiudyy/nazuna.git';
+const REPO_URL = 'https://github.com/leomodz262-hue/LEOBOTZAP.git';
 const BACKUP_DIR = path.join(process.cwd(), `backup_${new Date().toISOString().replace(/[:.]/g, '_').replace(/T/, '_')}`);
 const TEMP_DIR = path.join(process.cwd(), 'temp_nazuna');
 const isWindows = os.platform() === 'win32';
@@ -59,8 +59,8 @@ function setupGracefulShutdown() {
 
 async function displayHeader() {
   const header = [
-    `${colors.bold}🚀 Nazuna - Atualizador${colors.reset}`,
-    `${colors.bold}👨‍💻 Criado por Hiudy${colors.reset}`,
+    `${colors.bold}🚀 LEO MODZ BOT- Atualizador${colors.reset}`,
+    `${colors.bold}👨‍💻 Criado por LEO MODZ${colors.reset}`,
   ];
 
   printSeparator();

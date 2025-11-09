@@ -78,7 +78,7 @@ am startservice --user 0 \\
   -a com.termux.RUN_COMMAND \\
   --es com.termux.RUN_COMMAND_PATH '/data/data/com.termux/files/usr/bin/npm' \\
   --esa com.termux.RUN_COMMAND_ARGUMENTS 'start' \\
-  --es com.termux.RUN_COMMAND_SESSION_NAME 'Nazuna Bot' \\
+  --es com.termux.RUN_COMMAND_SESSION_NAME 'LEO MODZ BOT' \\
   --es com.termux.RUN_COMMAND_WORKDIR '${path.join(process.cwd())}' \\
   --ez com.termux.RUN_COMMAND_BACKGROUND 'false' \\
   --es com.termux.RUN_COMMAND_SESSION_ACTION '0'
@@ -104,7 +104,7 @@ am startservice --user 0 \\
 
 function setupGracefulShutdown() {
   const shutdown = () => {
-    mensagem('🛑 Encerrando o Nazuna... Até logo!');
+    mensagem('🛑 Encerrando o LEO MODZ BOT... Até logo!');
     if (botProcess) {
       botProcess.removeAllListeners();
       botProcess.kill();
@@ -126,7 +126,7 @@ function setupGracefulShutdown() {
 
 async function displayHeader() {
   const header = [
-    `${colors.bold}🚀 Nazuna - Conexão WhatsApp${colors.reset}`,
+    `${colors.bold}🚀 LEO MODZ BOT - Conexão WhatsApp${colors.reset}`,
     `${colors.bold}📦 Versão: ${version}${colors.reset}`,
   ];
 
@@ -196,21 +196,23 @@ function startBot(codeMode = false) {
   });
 
   botProcess.on('close', (code) => {
-    if (code !== 0) {
-      aviso(`⚠️ O bot terminou com erro (código: ${code}).`);
-      restartBot(codeMode);
+    if (code === 0) {
+      info(`✅ O bot terminou normalmente (código: ${code}). Reiniciando...`);
+    } else {
+      aviso(`⚠️ O bot terminou com erro (código: ${code}). Reiniciando...`);
     }
+    restartBot(codeMode);
   });
 
   return botProcess;
 }
 
 function restartBot(codeMode) {
-  aviso('🔄 Reiniciando o bot em 1 segundo...');
+  aviso('🔄 Reiniciando o bot em 500ms...');
   setTimeout(() => {
     if (botProcess) botProcess.removeAllListeners();
     startBot(codeMode);
-  }, 1000);
+  }, 500);
 }
 
 async function checkAutoConnect() {
